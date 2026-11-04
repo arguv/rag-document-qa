@@ -1,4 +1,4 @@
-fastapi
-uvicorn
-httpx2
-pytest
+fastapi==0.162.0
+uvicorn==0.54.0
+pypdf==6.21.4
+httpx2==2.14.0
