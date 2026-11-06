@@ -1,56 +1,60 @@
 # RAG Document Q&A
 
-A production-oriented Retrieval-Augmented Generation (RAG) application built with Python and FastAPI.
+A Python and FastAPI foundation for a Retrieval-Augmented Generation (RAG)
+application. The repository currently supports document loading, chunking,
+embedding generation, and cosine-similarity ranking. HTTP upload, persistence,
+retrieval APIs, and LLM answer generation are still planned.
 
-The project aims to provide accurate, context-aware answers to questions about uploaded documents by combining semantic retrieval with Large Language Models (LLMs).
+## Current status
 
-**Project Status:** In development — Step 1: Foundation
+Implemented:
 
-## Overview
+- FastAPI application with a health endpoint and OpenAPI documentation;
+- PDF, plain-text, and Markdown document loading;
+- PDF page metadata preservation;
+- immutable document and chunk domain models;
+- fixed-size, recursive, and Markdown-aware chunking strategies;
+- pluggable embedding providers;
+- Sentence Transformers embeddings using `all-MiniLM-L6-v2`; and
+- cosine-similarity ranking in the embedding demo.
 
-RAG combines information retrieval with generative AI. Instead of relying exclusively on an LLM's pretrained knowledge, the application retrieves relevant information from external documents and provides it as context when generating answers.
+Not implemented yet:
 
-The application is being developed incrementally, from a basic document Q&A system to an advanced RAG architecture with production-oriented engineering practices.
+- HTTP document upload;
+- persistent document or vector storage;
+- semantic or hybrid retrieval endpoints;
+- LLM-powered answers and source citations; and
+- authentication, observability, and deployment configuration.
 
-## Technology Stack
+## How it works
 
-| Category | Technology |
-|---|---|
-| Programming Language | Python |
-| Backend Framework | FastAPI |
+The intended document pipeline is:
+
+```text
+Document -> Parse -> Chunk -> Embed -> Vector store
+```
+
+The intended question-answering pipeline is:
+
+```text
+Question -> Embed -> Retrieve -> Context -> LLM -> Cited answer
+```
+
+The current code implements parsing, chunking, and embedding locally. The
+remaining retrieval and generation stages will build on these components.
+
+## Technology stack
+
+| Area | Technology |
+| --- | --- |
+| Language | Python 3.10+ |
+| API | FastAPI and Uvicorn |
+| Document parsing | `pypdf` |
+| Embeddings | Sentence Transformers and PyTorch |
 | Testing | Pytest |
-| Database (planned) | PostgreSQL |
-| Vector Search (planned) | pgvector |
-| Embeddings (planned) | Sentence Transformers |
-| LLM Integration (planned) | Configurable LLM API |
-| Advanced Workflows (planned) | LangGraph |
-| Containerization (planned) | Docker |
+| Planned storage | PostgreSQL and pgvector |
 
-## Features
-
-**Currently implemented**
-
-- FastAPI application setup
-- Health-check REST endpoint
-- Automated health endpoint test
-- Interactive API documentation
-
-**Planned features**
-
-- PDF, TXT, and Markdown document ingestion
-- Multiple document chunking strategies
-- Embedding generation
-- Persistent vector storage
-- Semantic and hybrid search
-- Retrieval reranking
-- LLM-powered question answering
-- Source citations
-- RAG quality evaluation
-- Authentication and document access control
-- Observability and monitoring
-- Docker and CI/CD
-
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
@@ -59,47 +63,39 @@ The application is being developed incrementally, from a basic document Q&A syst
 
 ### Installation
 
-Clone the repository:
-
 ```bash
 git clone https://github.com/arguv/rag-document-qa.git
 cd rag-document-qa
-```
 
-Create and activate a virtual environment:
-
-```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.txt
 ```
 
-Install dependencies:
+On Windows PowerShell, activate the environment with:
 
-```bash
-python -m pip install -r requirements.txt
+```powershell
+.venv\Scripts\Activate.ps1
 ```
 
-### Run the Application
+The first real embedding run may download the configured Sentence Transformers
+model (`sentence-transformers/all-MiniLM-L6-v2`).
+
+## Run the API
+
+Start the development server from the project root:
 
 ```bash
-python -m uvicorn app.main:app --reload --port 8001
+python -m uvicorn app.main:app --reload
 ```
 
-The API will be available at:
+The API is available at `http://127.0.0.1:8000`.
 
-`http://localhost:8001`
-
-### API Documentation
-
-With the current custom configuration:
-
-- Swagger UI: `http://localhost:8001/swagger`
-- OpenAPI schema: `http://localhost:8001/json.json`
-
-### Health Check
+### Health check
 
 ```bash
-curl http://localhost:8001/health
+curl http://127.0.0.1:8000/health
 ```
 
 Expected response:
@@ -111,62 +107,82 @@ Expected response:
 }
 ```
 
-## Running Tests
+Interactive Swagger UI is available at
+`http://127.0.0.1:8000/swagger`. The OpenAPI schema is available at
+`http://127.0.0.1:8000/json.json`.
+
+## Run the embedding demo
+
+The demo loads `examples/embedding_demo.md`, splits it into Markdown-aware
+chunks, embeds the chunks and a sample question, then prints chunks ordered by
+cosine similarity:
+
+```bash
+python -m scripts.step_04_embeddings
+```
+
+The demo uses a 300-character chunk size with 40 characters of overlap. The
+embedding provider can also be used independently:
+
+```python
+from app.infrastructure.document_loader import load_document
+from app.infrastructure.sentence_transformer_embeddings import (
+    SentenceTransformerEmbeddingProvider,
+)
+
+document = load_document("examples/embedding_demo.md")
+provider = SentenceTransformerEmbeddingProvider()
+vectors = provider.encode([document.text])
+```
+
+Supported document extensions are `.pdf`, `.txt`, and `.md`. Scanned PDFs
+without an extractable text layer and encrypted PDFs are not supported yet.
+
+## Run tests
 
 ```bash
 python -m pytest -v
 ```
 
-The current test suite verifies the health endpoint.
+The test suite covers the health endpoint, document loading and error cases,
+chunking behavior, metadata preservation, embedding validation, and cosine
+similarity.
 
-Additional unit, integration, and RAG evaluation tests will be introduced during development.
-
-## Project Structure
+## Project structure
 
 ```text
-rag-document-qa/
+.
 ├── app/
-│   ├── __init__.py
-│   └── main.py
-├── tests/
-│   └── test_health.py
-├── .gitignore
-├── EXPLANATION.md
-├── README.md
-└── requirements.txt
+│   ├── main.py                              # FastAPI application
+│   ├── application/
+│   │   ├── chunking.py                      # Chunking strategies
+│   │   └── embeddings.py                    # Embedding orchestration
+│   ├── domain/
+│   │   ├── chunks.py                        # Chunk model
+│   │   ├── documents.py                     # Parsed document models
+│   │   └── embeddings.py                    # Vectors and provider protocol
+│   └── infrastructure/
+│       ├── document_loader.py               # PDF, TXT, and Markdown loader
+│       └── sentence_transformer_embeddings.py
+├── examples/
+│   └── embedding_demo.md                   # Demo input document
+├── scripts/
+│   └── step_04_embeddings.py                # End-to-end local demo
+├── tests/                                   # Unit and API tests
+├── requirements.txt                         # Runtime dependencies
+├── requirements-dev.txt                     # Runtime + test dependencies
+└── EXPLANATION.md                           # Step-by-step project notes
 ```
-
-The structure will evolve as the ingestion, chunking, embedding, retrieval, and generation components are implemented.
-
-## Learning Documentation
-
-For detailed explanations of implementation steps, architecture decisions, and technical concepts, see [EXPLANATION.md](EXPLANATION.md).
-
-## Development Approach
-
-The project follows these engineering principles:
-
-- Modular and maintainable architecture
-- Separation of concerns
-- Testable components
-- Clear API contracts
-- Incremental development
-- Production-oriented engineering practices without unnecessary complexity
 
 ## Roadmap
 
-1. Project foundation
-2. Document ingestion and parsing
-3. Chunking strategies
-4. Embeddings and vector similarity
-5. PostgreSQL and pgvector
-6. Semantic retrieval and basic RAG
-7. LLM integration and citations
-8. Hybrid search and reranking
-9. Advanced retrieval techniques
-10. RAG evaluation
-11. Agentic RAG with LangGraph
-12. Security, observability, and production engineering
-13. Docker, CI/CD, and deployment
+1. Add HTTP document upload and production file validation.
+2. Persist parsed documents, chunks, and embeddings.
+3. Add semantic and hybrid retrieval.
+4. Connect retrieved context to an LLM.
+5. Return source citations with generated answers.
+6. Add retrieval and answer-quality evaluation.
+7. Add authentication, observability, Docker, CI/CD, and deployment support.
 
-The roadmap may evolve as the project develops.
+See [EXPLANATION.md](EXPLANATION.md) for architectural background and detailed
+implementation notes.

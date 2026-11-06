@@ -644,3 +644,444 @@ Document ingestion is the foundation of RAG.
 Before generating embeddings or performing semantic search, we must reliably extract text and preserve information about its source.
 
 The quality and structure of ingested documents directly influence the quality of retrieval and the accuracy of future source citations.
+
+
+---
+
+# Step 3 — Document Chunking
+
+## Goal
+
+Implement multiple text chunking strategies and preserve
+document metadata for future embedding and retrieval.
+
+## 1. What is Chunking?
+
+Chunking divides large documents into smaller text units.
+
+Each chunk can later be converted into an embedding
+and stored in a vector database.
+
+Smaller chunks improve retrieval granularity, but
+excessively small chunks may lose important context.
+
+## 2. Why Do We Need Chunking?
+
+Large documents can exceed embedding model input limits.
+
+Using entire documents as retrieval units can also
+include large amounts of irrelevant text.
+
+Chunking helps isolate relevant passages.
+
+## 3. Chunk Size and Overlap
+
+Chunk size defines the maximum number of characters
+in our current implementation.
+
+Overlap repeats part of the text between consecutive
+chunks from the same source section.
+
+Example:
+
+Text: ABCDEFGHIJKL
+Size: 5
+Overlap: 2
+
+Chunks:
+ABCDE
+DEFGH
+GHIJK
+JKL
+
+Overlap reduces boundary-related context loss but
+increases the amount of processed text.
+
+Character count is different from token count.
+
+## 4. Fixed-size Chunking
+
+Fixed-size chunking splits text into character windows.
+
+Advantages:
+- Simple implementation
+- Predictable maximum size
+- Low processing overhead
+
+Disadvantages:
+- Can split sentences
+- Does not understand document structure
+
+## 5. Recursive Chunking
+
+Our recursive splitter tries separators in priority order:
+
+1. Paragraph boundaries
+2. Newlines
+3. Sentence-like boundaries
+4. Spaces
+5. Character-length fallback
+
+It recursively checks lower-priority boundaries when
+a preferred separator cannot be used.
+
+This is a lightweight boundary-aware approach, not
+a complete linguistic sentence parser.
+
+## 6. Document-aware Chunking
+
+Document-aware chunking uses information about the
+original document's structure.
+
+For Markdown:
+- Identify headings
+- Split at heading boundaries
+- Preserve heading metadata
+
+For PDF:
+- Process extracted pages independently
+- Preserve original page numbers
+
+For TXT:
+- Apply boundary-aware splitting
+
+## 7. Architecture
+
+New files:
+
+app/domain/chunks.py
+app/application/chunking.py
+
+The domain layer defines the DocumentChunk data model.
+
+The application layer implements chunking algorithms.
+
+Chunking depends on domain models but does not depend
+on FastAPI or the PDF parsing library.
+
+## 8. Strategy Design Pattern
+
+Each chunker implements the same interface:
+
+chunk(document) -> list[DocumentChunk]
+
+Implementations:
+
+- FixedSizeChunker
+- RecursiveChunker
+- DocumentAwareChunker
+
+We use a Python Protocol to describe the interface.
+
+This makes chunking strategies interchangeable.
+
+## 9. Configuration Validation
+
+ChunkingSettings stores:
+
+- size
+- overlap
+
+Validation ensures:
+
+- size > 0
+- overlap >= 0
+- overlap < size
+
+This prevents invalid window calculations.
+
+## 10. Metadata Preservation
+
+Each DocumentChunk contains:
+
+- text
+- filename
+- file_type
+- page_number
+- chunk_index
+- strategy
+- heading
+
+Metadata allows future retrieval results to reference
+their source documents.
+
+Chunk indices are sequential within one chunking result.
+They are not yet persistent database identifiers.
+
+## 11. Testing
+
+We test:
+
+- Fixed-size splitting
+- Overlapping chunks
+- Recursive paragraph boundaries
+- Character-boundary fallback
+- Chunk-length limits
+- Markdown headings
+- PDF page metadata
+- Invalid configuration
+- Empty content
+
+Step 3 adds 12 test cases.
+
+Expected complete test suite:
+20 passed.
+
+## 12. Current Limitations
+
+- Chunk sizes are measured in characters, not tokens.
+- Boundary detection uses simple text rules.
+- Markdown handling supports basic ATX headings.
+- PDFs use extracted page boundaries.
+- No semantic chunking is implemented yet.
+- Chunks are not stored in a database.
+- Embeddings are not generated.
+- No retrieval evaluation has been performed.
+
+These are deliberate scope limitations for this step.
+
+## 13. Step 3 Result
+
+We now have three interchangeable chunking strategies
+that produce structured DocumentChunk objects.
+
+The chunking engine works with ParsedDocument objects
+created by the document loader from Step 2.
+
+The next step introduces embedding generation and
+vector similarity.
+
+## Key Takeaway
+
+Chunking is not simply splitting text.
+
+The strategy affects which information stays together,
+how much context is preserved, and what the retrieval
+system can find later.
+
+Chunking choices should ultimately be evaluated using
+real questions and retrieval-quality measurements.
+
+
+---
+
+# Step 4 — Embedding Generation and Vector Similarity
+
+## Goal
+
+Convert document chunks and user questions into numerical
+vectors and compare them using cosine similarity.
+
+## 1. What is an embedding?
+
+An embedding is a numerical representation of text.
+
+Embedding models are trained to place semantically related
+texts near one another in a multidimensional vector space.
+
+Example:
+
+"How do I reset my password?"
+
+The embedding model returns a vector such as:
+
+[0.12, -0.35, 0.81, ...]
+
+The values are learned representations, not manually
+assigned meanings.
+
+## 2. What is an embedding model?
+
+An embedding model converts input text into vectors.
+
+We use:
+
+sentence-transformers/all-MiniLM-L6-v2
+
+It generates 384-dimensional embeddings.
+
+The model runs locally using PyTorch and CPU inference.
+
+The model has a maximum input length of 256 tokens.
+Longer inputs may be truncated.
+
+## 3. What are vector dimensions?
+
+Dimensions are the number of numerical elements in
+an embedding.
+
+For our model:
+
+1 text -> 384 floating-point numbers
+
+Both document chunks and user questions must be embedded
+using compatible embedding models.
+
+Their vectors must have matching dimensions.
+
+## 4. Why embed document chunks?
+
+After chunking, documents still contain ordinary text.
+
+Embedding generation converts those chunks into
+numerical representations suitable for similarity search.
+
+Pipeline:
+
+Document -> Chunks -> Embeddings
+
+The next step will store these embeddings in PostgreSQL
+using pgvector.
+
+## 5. What is cosine similarity?
+
+Cosine similarity measures the directional similarity
+between two numerical vectors.
+
+Its mathematical range is from -1 to 1.
+
+1 means the same direction.
+0 means orthogonal vectors.
+-1 means opposite directions.
+
+A high similarity score does not guarantee that a chunk
+correctly answers a question.
+
+## 6. What is vector normalization?
+
+Normalization adjusts a nonzero vector to unit length.
+
+With unit-length vectors, their dot product equals
+their cosine similarity.
+
+We request normalized embeddings from
+Sentence Transformers.
+
+## 7. Architecture
+
+New files:
+
+app/domain/embeddings.py
+app/application/embeddings.py
+app/infrastructure/sentence_transformer_embeddings.py
+
+The domain defines EmbeddedChunk and EmbeddingProvider.
+
+The application layer coordinates vector generation
+and implements similarity calculations.
+
+The infrastructure layer integrates Sentence Transformers.
+
+## 8. What is EmbeddingProvider?
+
+EmbeddingProvider is a Python Protocol.
+
+It defines the method:
+
+encode(texts) -> list[Vector]
+
+Our application can use different embedding providers
+without depending directly on their libraries.
+
+This supports Dependency Inversion and testability.
+
+## 9. How does embed_chunks() work?
+
+1. Receive DocumentChunk objects.
+2. Validate that chunk text is not empty.
+3. Send the text to the embedding provider.
+4. Validate the returned vectors.
+5. Create EmbeddedChunk objects.
+6. Preserve the original chunk metadata.
+
+## 10. Why validate vectors?
+
+Embedding generation is an external dependency.
+
+Our application checks:
+
+- The returned vector count
+- Consistent vector dimensions
+- Nonempty vectors
+- Finite numerical values
+
+This helps detect malformed provider responses.
+
+## 11. How does embed_query() work?
+
+It converts a user question into an embedding.
+
+The same model used for document chunks is used
+for the query.
+
+Later, retrieval will compare query embeddings
+against stored document embeddings.
+
+## 12. What is in-memory similarity search?
+
+We can compare a question against document embeddings
+without a database.
+
+The process:
+
+Question -> Embedding -> Cosine Similarity -> Ranking
+
+This works for small examples.
+
+A vector database becomes useful for persistent storage,
+filtering, indexing, and larger document collections.
+
+## 13. How do we test embeddings?
+
+Unit tests use a fake embedding provider.
+
+This avoids downloading a real model during automated
+tests and produces predictable test results.
+
+We separately run a manual integration example using
+the real pretrained embedding model.
+
+Step 4 adds 16 test cases.
+
+Expected total project test count: 36.
+
+## 14. Current limitations
+
+- No persistent vector database
+- No vector indexing
+- No document upload API
+- No LLM answer generation
+- No source-aware retrieval service
+- Character-based rather than token-aware chunking
+- No embedding model version stored with vectors
+- No formal semantic retrieval evaluation
+- No automated real-model integration test
+
+The local model also has input-length and language
+limitations. It is primarily suitable for English text.
+
+## 15. Step 4 Result
+
+The project now supports:
+
+- Local text embedding generation
+- Query embedding generation
+- Structured EmbeddedChunk objects
+- Vector validation
+- Cosine similarity
+- Small in-memory similarity comparisons
+
+## Key Takeaway
+
+Embeddings transform text into vectors that allow
+computers to compare semantic similarity.
+
+Chunking determines which text is represented.
+
+The embedding model determines how that text is
+represented numerically.
+
+The retrieval system will use those representations
+to identify relevant information.
+
+Next: Step 5 — PostgreSQL and pgvector.
