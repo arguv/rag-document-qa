@@ -1085,3 +1085,291 @@ The retrieval system will use those representations
 to identify relevant information.
 
 Next: Step 5 — PostgreSQL and pgvector.
+
+
+---
+
+# Step 5 — PostgreSQL and pgvector
+
+## Goal
+
+Persist documents, chunks, and embeddings in PostgreSQL,
+then perform similarity search directly in the database.
+
+## 1. Why do we need a vector database?
+
+In Step 4, embeddings were stored only in Python memory.
+
+When the Python process ended, those embeddings were lost.
+
+We also needed to calculate similarities against every
+chunk in Python.
+
+A vector database provides persistent storage and
+database-level similarity operations.
+
+## 2. What is pgvector?
+
+pgvector is a PostgreSQL extension for vector storage
+and similarity search.
+
+It adds:
+
+- Vector column types
+- Vector similarity operators
+- Distance calculations
+- Approximate nearest-neighbor indexes
+
+We can combine ordinary relational data and embeddings
+in the same database.
+
+## 3. Our database schema
+
+We created two tables:
+
+documents:
+- id
+- filename
+- file_type
+- embedding_model
+- created_at
+
+document_chunks:
+- id
+- document_id
+- chunk_index
+- text
+- page_number
+- heading
+- strategy
+- embedding
+
+Relationship:
+
+One document -> Many document chunks
+
+Each chunk has a foreign key referencing its source
+document.
+
+Deleting a document cascades to its chunks.
+
+## 4. What is VECTOR(384)?
+
+VECTOR is a pgvector data type.
+
+384 specifies the number of dimensions.
+
+Our Sentence Transformers model generates
+384-dimensional embeddings.
+
+The database expects each stored vector to have
+exactly this number of dimensions.
+
+A different embedding model may require a different
+schema or storage strategy.
+
+## 5. What is SQLAlchemy?
+
+SQLAlchemy is a Python database toolkit and ORM.
+
+It lets us map Python classes to database tables and
+construct SQL queries using Python expressions.
+
+Our ORM models are separate from our domain models.
+
+Domain models represent application concepts.
+
+ORM models represent database storage.
+
+## 6. What is Psycopg?
+
+Psycopg is a PostgreSQL driver for Python.
+
+SQLAlchemy uses it to communicate with PostgreSQL.
+
+Our connection URL uses the psycopg dialect:
+
+postgresql+psycopg://...
+
+## 7. What is Alembic?
+
+Alembic manages database schema migrations.
+
+Every migration describes a version-controlled change
+to the database structure.
+
+Important commands:
+
+alembic upgrade head
+alembic current
+alembic history
+
+We use migrations instead of manually creating tables.
+
+## 8. What is the Repository pattern?
+
+A repository encapsulates database persistence and
+retrieval operations.
+
+Our PgvectorRepository provides:
+
+save_document()
+search()
+
+Application services do not need to know the underlying
+SQL expressions.
+
+The repository receives a SQLAlchemy Session.
+
+The caller controls transaction boundaries.
+
+## 9. What is a database transaction?
+
+A transaction groups database changes into a single
+logical operation.
+
+For example, saving a document may insert:
+
+- One document record
+- Multiple chunk records
+- Multiple associated vectors
+
+These inserts should succeed together.
+
+If an error occurs, the transaction can roll back
+the changes instead of leaving partially saved data.
+
+## 10. What is cosine distance?
+
+In Step 4, we calculated cosine similarity in Python.
+
+pgvector supports cosine distance with:
+
+embedding <=> query_vector
+
+To calculate similarity:
+
+similarity = 1 - cosine_distance
+
+A lower distance indicates vectors pointing in more
+similar directions.
+
+A higher cosine similarity indicates more similar
+vector directions.
+
+Similarity is not a probability of correctness.
+
+## 11. What is nearest-neighbor search?
+
+Nearest-neighbor search retrieves vectors closest to
+a query vector according to a distance metric.
+
+Our workflow:
+
+1. User submits a question.
+2. The embedding model generates a query vector.
+3. PostgreSQL compares it with stored chunk vectors.
+4. Results are ordered by cosine distance.
+5. The most similar chunks are returned.
+
+This step uses exact vector search.
+
+Approximate nearest-neighbor indexing will be evaluated
+when the dataset becomes large enough to justify it.
+
+## 12. Why save the embedding model name?
+
+Different embedding models may produce incompatible
+representations.
+
+Even models with the same number of dimensions may
+represent semantic relationships differently.
+
+We associate documents with their embedding model and
+filter retrieval by model name.
+
+For stronger reproducibility, future steps can track
+an exact model revision and embedding configuration.
+
+## 13. Why use Docker Compose?
+
+Docker Compose provides a repeatable local database
+environment.
+
+Our PostgreSQL database runs in a separate container.
+
+The database uses host port 5433 to avoid conflicts
+with other local PostgreSQL projects.
+
+A named Docker volume preserves database files
+between normal container restarts.
+
+## 14. Why use separate databases for testing?
+
+Integration tests should not modify real application
+data.
+
+We use:
+
+rag_documents       - Development database
+rag_documents_test  - Integration testing database
+
+This prevents test data from interfering with
+development documents.
+
+## 15. What do our tests verify?
+
+The new integration test checks:
+
+- Document persistence
+- Vector persistence
+- Database transactions
+- Retrieval in a new database session
+- Cosine similarity ordering
+- Original source metadata
+- Cleanup after testing
+
+Existing unit tests remain independent of PostgreSQL.
+
+Expected complete test count: 37.
+
+## 16. Current limitations
+
+- No document upload REST endpoint yet
+- No dedicated retrieval application service
+- No HNSW or IVFFlat index yet
+- No hybrid search
+- No reranking
+- No automatic document deduplication
+- No reindexing workflow
+- No authentication or access control
+- No production database backup configuration
+- No LLM answer generation
+
+These are planned improvements, not completed features.
+
+## 17. Step 5 Result
+
+We have connected the components built so far:
+
+Document -> Parsing -> Chunking -> Embeddings
+-> PostgreSQL + pgvector -> Similarity Search
+
+Our application can now persist embeddings and search
+them after the original Python process has finished.
+
+## Key Takeaway
+
+PostgreSQL with pgvector combines traditional relational
+storage with numerical similarity search.
+
+A vector database is not responsible for understanding
+documents or generating embeddings.
+
+Those responsibilities belong to our document-processing
+and embedding components.
+
+The database stores the resulting information and
+retrieves the most relevant vectors when queried.
+
+

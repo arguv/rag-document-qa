@@ -1,9 +1,9 @@
 # RAG Document Q&A
 
 A Python and FastAPI foundation for a Retrieval-Augmented Generation (RAG)
-application. The repository currently supports document loading, chunking,
-embedding generation, and cosine-similarity ranking. HTTP upload, persistence,
-retrieval APIs, and LLM answer generation are still planned.
+application. The repository supports document loading, chunking, embedding
+generation, PostgreSQL/pgvector persistence, and cosine-similarity search.
+HTTP upload, retrieval APIs, and LLM answer generation are still planned.
 
 ## Current status
 
@@ -16,15 +16,17 @@ Implemented:
 - fixed-size, recursive, and Markdown-aware chunking strategies;
 - pluggable embedding providers;
 - Sentence Transformers embeddings using `all-MiniLM-L6-v2`; and
-- cosine-similarity ranking in the embedding demo.
+- cosine-similarity ranking in the embedding demo;
+- SQLAlchemy models and a repository for storing embedded chunks in pgvector;
+- Alembic migrations for the vector-storage schema; and
+- a PostgreSQL-backed vector search demo.
 
 Not implemented yet:
 
 - HTTP document upload;
-- persistent document or vector storage;
 - semantic or hybrid retrieval endpoints;
 - LLM-powered answers and source citations; and
-- authentication, observability, and deployment configuration.
+- authentication, observability, and production deployment configuration.
 
 ## How it works
 
@@ -40,8 +42,9 @@ The intended question-answering pipeline is:
 Question -> Embed -> Retrieve -> Context -> LLM -> Cited answer
 ```
 
-The current code implements parsing, chunking, and embedding locally. The
-remaining retrieval and generation stages will build on these components.
+The current code implements parsing, chunking, embedding, persistence, and
+database-level vector search locally. The remaining HTTP and generation stages
+will build on these components.
 
 ## Technology stack
 
@@ -52,7 +55,9 @@ remaining retrieval and generation stages will build on these components.
 | Document parsing | `pypdf` |
 | Embeddings | Sentence Transformers and PyTorch |
 | Testing | Pytest |
-| Planned storage | PostgreSQL and pgvector |
+| Storage | PostgreSQL and pgvector |
+| Database access | SQLAlchemy and Alembic |
+| Local services | Docker Compose |
 
 ## Getting started
 
@@ -81,6 +86,21 @@ On Windows PowerShell, activate the environment with:
 
 The first real embedding run may download the configured Sentence Transformers
 model (`sentence-transformers/all-MiniLM-L6-v2`).
+
+### Start PostgreSQL with pgvector
+
+Copy the example environment file and start the database service:
+
+```bash
+cp .env.example .env
+docker compose up -d db
+python -m alembic upgrade head
+```
+
+The Compose service exposes PostgreSQL on `127.0.0.1:5433` and stores its data
+in the named `rag_postgres_data` volume. The default development database is
+`rag_documents`. Keep `TEST_DATABASE_URL` pointed at the separate
+`rag_documents_test` database when running integration tests.
 
 ## Run the API
 
@@ -135,6 +155,20 @@ provider = SentenceTransformerEmbeddingProvider()
 vectors = provider.encode([document.text])
 ```
 
+## Persist and search vectors
+
+After PostgreSQL is running and the migration has been applied, run the
+database-backed demo:
+
+```bash
+python -m scripts.step_05_vector_storage
+```
+
+It loads and chunks the example document, generates 384-dimensional embeddings,
+saves the document and chunks in PostgreSQL, and searches them using pgvector
+cosine distance. The repository stores the embedding model name with each
+document so searches can be restricted to compatible vectors.
+
 Supported document extensions are `.pdf`, `.txt`, and `.md`. Scanned PDFs
 without an extractable text layer and encrypted PDFs are not supported yet.
 
@@ -167,7 +201,11 @@ similarity.
 ├── examples/
 │   └── embedding_demo.md                   # Demo input document
 ├── scripts/
-│   └── step_04_embeddings.py                # End-to-end local demo
+│   ├── step_04_embeddings.py                # Local embedding demo
+│   └── step_05_vector_storage.py            # PostgreSQL/pgvector demo
+├── migrations/                              # Alembic migrations
+├── compose.yaml                             # Local PostgreSQL service
+├── .env.example                             # Development DB settings
 ├── tests/                                   # Unit and API tests
 ├── requirements.txt                         # Runtime dependencies
 ├── requirements-dev.txt                     # Runtime + test dependencies
@@ -177,12 +215,11 @@ similarity.
 ## Roadmap
 
 1. Add HTTP document upload and production file validation.
-2. Persist parsed documents, chunks, and embeddings.
-3. Add semantic and hybrid retrieval.
-4. Connect retrieved context to an LLM.
-5. Return source citations with generated answers.
-6. Add retrieval and answer-quality evaluation.
-7. Add authentication, observability, Docker, CI/CD, and deployment support.
+2. Expose semantic and hybrid retrieval through the API.
+3. Connect retrieved context to an LLM.
+4. Return source citations with generated answers.
+5. Add retrieval and answer-quality evaluation.
+6. Add authentication, observability, CI/CD, and production deployment support.
 
 See [EXPLANATION.md](EXPLANATION.md) for architectural background and detailed
 implementation notes.
