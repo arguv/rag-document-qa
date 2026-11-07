@@ -1,122 +1,99 @@
 # RAG Document Q&A
 
-A Python and FastAPI foundation for a Retrieval-Augmented Generation (RAG)
-application. The repository supports document loading, chunking, embedding
-generation, PostgreSQL/pgvector persistence, semantic retrieval, and
-source-labeled context assembly. HTTP upload, retrieval APIs, and LLM answer
-generation are still planned.
+A Python/FastAPI foundation for Retrieval-Augmented Generation (RAG). The
+project loads PDF, plain-text, and Markdown documents, chunks and embeds their
+content, stores vectors in PostgreSQL with pgvector, retrieves relevant
+passages, and can generate source-aware answers through the OpenAI Responses
+API.
+
+The HTTP API currently exposes a health check. Ingestion, retrieval, and
+answering are available as reusable services and runnable demo scripts.
 
 ## Current status
 
 Implemented:
 
-- FastAPI application with a health endpoint and OpenAPI documentation;
-- PDF, plain-text, and Markdown document loading;
-- PDF page metadata preservation;
-- immutable document and chunk domain models;
-- fixed-size, recursive, and Markdown-aware chunking strategies;
-- pluggable embedding providers;
-- Sentence Transformers embeddings using `all-MiniLM-L6-v2`; and
-- cosine-similarity ranking in the embedding demo;
-- SQLAlchemy models and a repository for storing embedded chunks in pgvector;
-- Alembic migrations for the vector-storage schema; and
-- a PostgreSQL-backed vector search demo;
-- a semantic retrieval service with top-k search, document filtering, and
-  optional similarity thresholds; and
-- structured retrieval results with source-labeled context ready for an LLM.
+- FastAPI application with `/health` and OpenAPI documentation;
+- PDF, TXT, and Markdown loading with PDF page metadata;
+- immutable document, chunk, embedding, retrieval, and answer models;
+- fixed-size, recursive, and Markdown-aware chunking;
+- Sentence Transformers embeddings using `all-MiniLM-L6-v2`;
+- SQLAlchemy/pgvector persistence, Alembic migrations, and cosine search;
+- semantic retrieval with top-k, document, and similarity filtering;
+- source-labeled retrieval context; and
+- OpenAI-backed structured answer generation with citation validation.
 
 Not implemented yet:
 
 - HTTP document upload;
 - REST retrieval and question-answering endpoints;
-- hybrid retrieval, reranking, and query rewriting;
-- LLM-powered answers and source citations; and
+- hybrid retrieval, reranking, and query rewriting; and
 - authentication, observability, evaluation, and production deployment
   configuration.
 
 ## How it works
 
-The intended document pipeline is:
-
 ```text
-Document -> Parse -> Chunk -> Embed -> Vector store
+Document -> Parse -> Chunk -> Embed -> PostgreSQL/pgvector
+Question -> Embed -> Retrieve -> Filter -> Context -> OpenAI -> Answer + citations
 ```
 
-The retrieval pipeline implemented by the project is:
-
-```text
-Question -> Embed -> Retrieve -> Filter -> Context
-```
-
-The intended question-answering pipeline adds generation:
-
-```text
-Question -> Embed -> Retrieve -> Filter -> Context -> LLM -> Cited answer
-```
-
-The current code implements parsing, chunking, embedding, persistence,
-database-level vector search, and application-level semantic retrieval locally.
-The remaining HTTP and generation stages will build on these components.
+The answer service does not call the LLM when retrieval returns no evidence.
+It also rejects answers that are unanswerable or cite nonexistent retrieval
+sources.
 
 ## Technology stack
 
 | Area | Technology |
 | --- | --- |
 | Language | Python 3.10+ |
-| API | FastAPI and Uvicorn |
+| API server | FastAPI and Uvicorn |
 | Document parsing | `pypdf` |
-| Embeddings | Sentence Transformers and PyTorch |
-| Testing | Pytest |
-| Storage | PostgreSQL and pgvector |
-| Database access | SQLAlchemy and Alembic |
-| Local services | Docker Compose |
+| Embeddings | `sentence-transformers` and `torch` |
+| Answer generation | `openai` |
+| Database access | SQLAlchemy and Psycopg |
+| Vector storage | PostgreSQL and `pgvector` |
+| Migrations | Alembic |
+| Configuration | `python-dotenv` |
+| Testing | Pytest and ReportLab |
+| Local database | Docker Compose |
+
+Pinned runtime dependencies are in [requirements.txt](requirements.txt).
+Development and test dependencies are added by
+[requirements-dev.txt](requirements-dev.txt).
 
 ## Getting started
 
-### Prerequisites
-
-- Python 3.10 or newer
-- Git
-
-### Installation
+Prerequisites: Python 3.10+, Git, Docker Compose for database demos, and an
+OpenAI API key for answer generation.
 
 ```bash
 git clone https://github.com/arguv/rag-document-qa.git
 cd rag-document-qa
-
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
+cp .env.example .env
 ```
 
-On Windows PowerShell, activate the environment with:
+On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
 
-```powershell
-.venv\Scripts\Activate.ps1
-```
+The first embedding run may download
+`sentence-transformers/all-MiniLM-L6-v2`. Do not commit `.env` or a real API
+key. Set `OPENAI_MODEL` to a model available in your OpenAI account.
 
-The first real embedding run may download the configured Sentence Transformers
-model (`sentence-transformers/all-MiniLM-L6-v2`).
-
-### Start PostgreSQL with pgvector
-
-Copy the example environment file and start the database service:
+### Start PostgreSQL
 
 ```bash
-cp .env.example .env
 docker compose up -d db
 python -m alembic upgrade head
 ```
 
-The Compose service exposes PostgreSQL on `127.0.0.1:5433` and stores its data
-in the named `rag_postgres_data` volume. The default development database is
-`rag_documents`. Keep `TEST_DATABASE_URL` pointed at the separate
-`rag_documents_test` database when running integration tests.
+PostgreSQL is exposed on `127.0.0.1:5433` and uses the named
+`rag_postgres_data` volume. The default database is `rag_documents`.
 
 ## Run the API
-
-Start the development server from the project root:
 
 ```bash
 python -m uvicorn app.main:app --reload
@@ -124,77 +101,28 @@ python -m uvicorn app.main:app --reload
 
 The API is available at `http://127.0.0.1:8000`.
 
-### Health check
-
 ```bash
 curl http://127.0.0.1:8000/health
 ```
 
-Expected response:
+Swagger UI: `http://127.0.0.1:8000/swagger`
 
-```json
-{
-  "status": "ok",
-  "service": "rag-document-qa"
-}
-```
+OpenAPI JSON: `http://127.0.0.1:8000/json.json`
 
-Interactive Swagger UI is available at
-`http://127.0.0.1:8000/swagger`. The OpenAPI schema is available at
-`http://127.0.0.1:8000/json.json`.
+## Run the demos
 
-## Run the embedding demo
-
-The demo loads `examples/embedding_demo.md`, splits it into Markdown-aware
-chunks, embeds the chunks and a sample question, then prints chunks ordered by
-cosine similarity:
+Run these from the project root in order when database-backed behavior is
+needed:
 
 ```bash
 python -m scripts.step_04_embeddings
-```
-
-The demo uses a 300-character chunk size with 40 characters of overlap. The
-embedding provider can also be used independently:
-
-```python
-from app.infrastructure.document_loader import load_document
-from app.infrastructure.sentence_transformer_embeddings import (
-    SentenceTransformerEmbeddingProvider,
-)
-
-document = load_document("examples/embedding_demo.md")
-provider = SentenceTransformerEmbeddingProvider()
-vectors = provider.encode([document.text])
-```
-
-## Retrieve relevant context
-
-After storing the example document with the vector-storage demo, run the
-semantic retrieval demo:
-
-```bash
-python -m scripts.step_06_retrieval
-```
-
-The demo embeds a question, searches PostgreSQL for the nearest chunks, limits
-results to the selected document, applies a minimum cosine-similarity score,
-and prints source-labeled context. The `RetrievalService` accepts `top_k`
-values from 1 to 50 and can also be used with fake providers and repositories
-in unit tests.
-
-## Persist and search vectors
-
-After PostgreSQL is running and the migration has been applied, run the
-database-backed demo:
-
-```bash
 python -m scripts.step_05_vector_storage
+python -m scripts.step_06_retrieval
+python -m scripts.step_07_answers
 ```
 
-It loads and chunks the example document, generates 384-dimensional embeddings,
-saves the document and chunks in PostgreSQL, and searches them using pgvector
-cosine distance. The repository stores the embedding model name with each
-document so searches can be restricted to compatible vectors.
+The final demo requires `OPENAI_API_KEY`, expects the sample document created
+by step 5, and prints a validated answer with source metadata.
 
 Supported document extensions are `.pdf`, `.txt`, and `.md`. Scanned PDFs
 without an extractable text layer and encrypted PDFs are not supported yet.
@@ -205,11 +133,9 @@ without an extractable text layer and encrypted PDFs are not supported yet.
 python -m pytest -v
 ```
 
-The test suite covers the health endpoint, document loading and error cases,
-chunking behavior, metadata preservation, embedding validation, cosine
-similarity, vector persistence, and semantic retrieval behavior. Retrieval
-tests cover query embedding, top-k and document filtering, similarity
-thresholds, context formatting, empty results, and invalid inputs.
+The suite covers the health endpoint, loading, chunking, metadata, embeddings,
+vector persistence, retrieval, and answer-service validation. Database tests
+require the configured PostgreSQL test database.
 
 ## Project structure
 
@@ -218,43 +144,31 @@ thresholds, context formatting, empty results, and invalid inputs.
 ├── app/
 │   ├── main.py                              # FastAPI application
 │   ├── application/
-│   │   ├── chunking.py                      # Chunking strategies
-│   │   ├── embeddings.py                    # Embedding orchestration
-│   │   └── retrieval.py                     # Semantic retrieval service
-│   ├── domain/
-│   │   ├── chunks.py                        # Chunk model
-│   │   ├── documents.py                     # Parsed document models
-│   │   ├── embeddings.py                     # Vectors and provider protocol
-│   │   ├── retrieval.py                      # Retrieval result model
-│   │   └── search.py                         # Search match model
-│   └── infrastructure/
-│       ├── database/                        # SQLAlchemy/pgvector persistence
-│       ├── document_loader.py               # PDF, TXT, and Markdown loader
-│       └── sentence_transformer_embeddings.py
-├── examples/
-│   └── embedding_demo.md                   # Demo input document
-├── scripts/
-│   ├── step_04_embeddings.py                # Local embedding demo
-│   ├── step_05_vector_storage.py            # PostgreSQL/pgvector demo
-│   └── step_06_retrieval.py                 # Semantic retrieval demo
-├── migrations/                              # Alembic migrations
-├── compose.yaml                             # Local PostgreSQL service
-├── .env.example                             # Development DB settings
-├── tests/                                   # Unit and API tests
-├── requirements.txt                         # Runtime dependencies
-├── requirements-dev.txt                     # Runtime + test dependencies
-└── EXPLANATION.md                           # Step-by-step project notes
+│   │   ├── answering.py                     # Retrieval + answer orchestration
+│   │   ├── chunking.py                       # Chunking strategies
+│   │   ├── embeddings.py                     # Embedding orchestration
+│   │   └── retrieval.py                      # Semantic retrieval service
+│   ├── core/config.py                        # Environment-backed settings
+│   ├── domain/                               # Domain models and protocols
+│   └── infrastructure/                       # Database, embeddings, and OpenAI adapters
+├── examples/                                 # Demo input documents
+├── scripts/                                  # Steps 4–7 runnable demos
+├── migrations/                               # Alembic migrations
+├── tests/                                    # Unit and integration tests
+├── compose.yaml                              # Local PostgreSQL service
+├── .env.example                              # Environment template
+├── requirements.txt                          # Runtime dependencies
+├── requirements-dev.txt                      # Runtime + test dependencies
+└── EXPLANATION.md                            # Architecture and implementation notes
 ```
 
 ## Roadmap
 
 1. Add HTTP document upload and production file validation.
-2. Expose semantic retrieval through the API.
+2. Expose retrieval and answering through the API.
 3. Add hybrid retrieval, reranking, and query rewriting.
-4. Connect retrieved context to an LLM.
-5. Return and validate source citations with generated answers.
-6. Add retrieval and answer-quality evaluation.
-7. Add authentication, observability, CI/CD, and production deployment support.
+4. Add retrieval and answer-quality evaluation.
+5. Add authentication, observability, CI/CD, and deployment support.
 
-See [EXPLANATION.md](EXPLANATION.md) for architectural background and detailed
-implementation notes.
+See [EXPLANATION.md](EXPLANATION.md) for architecture and implementation
+details.

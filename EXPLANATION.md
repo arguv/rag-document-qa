@@ -1,1639 +1,233 @@
-# RAG Document Q&A
+# RAG Document Q&A — Architecture and Implementation Notes
 
-A FastAPI service for building a Retrieval-Augmented Generation (RAG)
-application. The project currently provides the API foundation and a reusable
-document-ingestion component for PDF, TXT, and Markdown files.
+This project is a modular Python implementation of a Retrieval-Augmented
+Generation (RAG) pipeline. It separates document parsing, chunking, embedding,
+storage, retrieval, and answer generation so each stage can be tested and
+replaced independently.
 
 ## Current status
 
-The project currently includes:
+The repository currently contains:
 
-- a FastAPI application in `app/main.py`;
-- a `GET /health` endpoint;
-- generated Swagger UI at `/swagger`;
-- an OpenAPI JSON document at `/json.json`; and
-- a pytest test for the health endpoint;
-- immutable `DocumentSection` and `ParsedDocument` domain models;
-- a document loader in `app/infrastructure/document_loader.py`;
-- PDF, TXT, and Markdown text extraction;
-- PDF page metadata preservation; and
-- consistent `DocumentLoadError` handling for invalid or unsupported files.
+- a FastAPI application with `GET /health`;
+- PDF, TXT, and Markdown document loading;
+- immutable document and chunk domain models;
+- fixed-size, recursive, and Markdown-aware chunking;
+- Sentence Transformers embeddings;
+- PostgreSQL/pgvector persistence and cosine-distance search;
+- semantic retrieval with top-k, document, and similarity filtering;
+- source-labeled retrieval context;
+- an OpenAI Responses API answer generator using structured output; and
+- an answer service that validates answerability and citations.
 
-HTTP document upload, chunking, embeddings, vector search, and LLM answer
-generation are not implemented yet.
+HTTP upload, retrieval, and question-answering endpoints are intentionally not
+implemented yet. The current workflows are exercised through `scripts/`.
 
 ## What is RAG?
 
-Retrieval-Augmented Generation combines two steps:
+RAG combines retrieval from an external knowledge base with generation by a
+language model. The model receives relevant document passages instead of
+having to rely only on its training data.
 
-1. retrieve relevant information from an external knowledge base; and
-2. provide that information to a language model so it can generate a grounded
-   answer.
-
-The intended document-ingestion pipeline is:
+The document pipeline runs once per document:
 
 ```text
-Documents -> Parsing -> Chunking -> Embeddings -> Vector database
+Document -> Parse -> Chunk -> Embed -> Vector store
 ```
 
-The intended question-answering pipeline is:
+The question pipeline runs for each question:
 
 ```text
-Question -> Retrieval -> Context -> LLM -> Answer
+Question -> Embed -> Retrieve -> Filter -> Context -> LLM -> Answer + citations
 ```
 
-These pipelines are separate so documents can be processed once and reused
-for many questions.
+Separating these pipelines lets the application process documents once and
+reuse their vectors for many questions.
 
-## Requirements
+## Layered architecture
 
-- Python 3.10 or newer
-- `pip`
+### Domain layer
 
-Dependencies are listed in `requirements.txt`.
+The domain package describes the problem space without depending on FastAPI,
+PostgreSQL, or an external model provider:
 
-## Setup
+- `documents.py` — parsed documents and page-aware sections;
+- `chunks.py` — searchable chunks and chunk metadata;
+- `embeddings.py` — embedding vectors and provider protocol;
+- `search.py` — individual search matches;
+- `retrieval.py` — retrieval results and formatted context; and
+- `generation.py` — answer drafts, citations, and final answer results.
 
-Create and activate a virtual environment, then install the dependencies:
+The models use frozen dataclasses where practical. This prevents later stages
+from accidentally changing source data or retrieval metadata used for
+citations.
+
+### Application layer
+
+The application package coordinates use cases:
+
+- `chunking.py` turns parsed documents into searchable chunks;
+- `embeddings.py` coordinates embedding providers;
+- `retrieval.py` embeds a question, queries the repository, applies filters,
+  and formats source-labeled context; and
+- `answering.py` calls retrieval, invokes an answer generator only when there
+  is evidence, and validates the generator's source numbers.
+
+These services depend on domain protocols rather than concrete database or
+LLM implementations, making them testable with fakes.
+
+### Infrastructure layer
+
+The infrastructure package contains adapters to external systems:
+
+- `document_loader.py` reads local PDF, TXT, and Markdown files;
+- `sentence_transformer_embeddings.py` uses the local
+  `all-MiniLM-L6-v2` model;
+- `database/` contains SQLAlchemy models, sessions, and the pgvector
+  repository; and
+- `openai_answer_generator.py` calls the OpenAI Responses API and parses a
+  structured answer.
+
+## Document ingestion
+
+`load_document(path)` returns a common `ParsedDocument` regardless of file
+format.
+
+TXT and Markdown files are read as UTF-8 text. Markdown syntax is preserved so
+the Markdown-aware chunker can use headings and retain heading metadata.
+
+`pypdf` extracts PDF text page by page. Each non-empty page becomes a document
+section with its original one-based page number. `page_count` records the total
+number of pages and may be greater than the number of sections when a PDF has
+blank or non-extractable pages.
+
+Scanned image-only PDFs require OCR and are rejected when no text can be
+extracted. Encrypted PDFs are not supported by the current loader.
+
+`DocumentLoadError` gives callers one consistent exception type for missing,
+unsupported, empty, unreadable, or invalid documents. The original exception
+is retained as the cause when the parser provides one.
+
+## Chunking
+
+Chunking divides parsed text into units suitable for embedding and retrieval.
+The implementation supports:
+
+- fixed-size windows for predictable chunk lengths;
+- recursive splitting that prefers paragraphs, newlines, sentence-like
+  boundaries, spaces, and finally character boundaries; and
+- Markdown-aware splitting that uses headings and preserves heading metadata.
+
+Chunk size is measured in characters, not tokens. Overlap repeats trailing
+content between adjacent chunks from the same source section. Overlap reduces
+context loss at boundaries but increases processed text. PDF page numbers and
+Markdown headings are carried into chunk metadata for source tracking.
+
+## Embeddings and vector storage
+
+The default provider uses Sentence Transformers with
+`sentence-transformers/all-MiniLM-L6-v2`. It exposes its model name and vector
+dimension and validates that generated vectors match the configured model.
+
+The storage layer uses SQLAlchemy with Psycopg and the `pgvector` extension.
+Each stored document records its embedding model. Searches use cosine distance
+and can be restricted to matching models so incompatible vector spaces are not
+mixed.
+
+The schema is managed by Alembic:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m alembic upgrade head
 ```
 
-On Windows PowerShell, activate the environment with:
+The local PostgreSQL service is defined in `compose.yaml` and exposed on port
+`5433`.
 
-```powershell
-.venv\Scripts\Activate.ps1
+## Retrieval
+
+`RetrievalService` performs these operations:
+
+1. Validate the question and `top_k` range.
+2. Embed the question with the configured provider.
+3. Search PostgreSQL/pgvector for nearest chunks.
+4. Optionally restrict matches to a document ID.
+5. Optionally remove matches below a minimum cosine-similarity threshold.
+6. Return structured matches and source-labeled context.
+
+The context labels each match as `Source [n]`. Those numbers are used by the
+answer generator to identify supporting citations.
+
+## Answer generation and citation validation
+
+`OpenAIAnswerGenerator` sends the question and retrieved context to the OpenAI
+Responses API. It requests a structured response containing `answer`,
+`is_answerable`, and `source_numbers`.
+
+The system instructions treat retrieved text as untrusted document data, not
+as instructions. The generator must answer only from supplied context and use
+source numbers from the context labels.
+
+`AnswerService` adds application safeguards:
+
+- no LLM call is made when retrieval returns no matches;
+- an unanswerable or blank answer becomes an `insufficient_context` result;
+- at least one citation is required for an answer;
+- every source number must refer to an actual retrieved match; and
+- duplicate source numbers are removed while preserving order.
+
+The final result contains the answer, status, and structured citations with
+filename, chunk index, page number, and heading metadata.
+
+## Configuration
+
+Configuration is loaded from `.env` using `python-dotenv`:
+
+```dotenv
+DATABASE_URL=postgresql+psycopg://rag_user:rag_local_password@127.0.0.1:5433/rag_documents
+TEST_DATABASE_URL=postgresql+psycopg://rag_user:rag_local_password@127.0.0.1:5433/rag_documents_test
+OPENAI_API_KEY=replace_with_your_api_key
+OPENAI_MODEL=gpt-6-luna
 ```
 
-## Run the API
+The database URL is required by the database session factory. A valid OpenAI
+key is required only by `OpenAIAnswerGenerator` and the step 7 demo. Use an
+OpenAI model name available in your account.
 
-Start the development server from the project root:
+## Running the implementation
+
+Install runtime and development dependencies:
 
 ```bash
-uvicorn app.main:app --reload
+python -m pip install -r requirements-dev.txt
 ```
 
-The service is available at `http://127.0.0.1:8000`.
-
-### Health check
+Start the database and apply migrations, then run the demos in sequence:
 
 ```bash
-curl http://127.0.0.1:8000/health
+docker compose up -d db
+python -m alembic upgrade head
+python -m scripts.step_04_embeddings
+python -m scripts.step_05_vector_storage
+python -m scripts.step_06_retrieval
+python -m scripts.step_07_answers
 ```
 
-Expected response:
-
-```json
-{
-  "status": "ok",
-  "service": "rag-document-qa"
-}
-```
-
-Interactive API documentation is available at
-`http://127.0.0.1:8000/swagger`.
-
-## Run tests
-
-```bash
-pytest
-```
-
-The health test verifies both the HTTP 200 response and the response body.
-
-## Project structure
-
-```text
-.
-├── app/
-│   ├── __init__.py
-│   ├── main.py                    # FastAPI application and health endpoint
-│   ├── domain/
-│   │   └── documents.py           # Parsed document data models
-│   └── infrastructure/
-│       └── document_loader.py     # PDF, TXT, and Markdown loader
-├── tests/
-│   ├── test_health.py             # API health check test
-│   └── test_document_loader.py    # Document ingestion tests
-├── requirements.txt               # Runtime dependencies
-├── requirements-dev.txt           # Test and development dependencies
-└── EXPLANATION.md                 # Project documentation
-```
-
-## Planned next steps
-
-1. Add HTTP document upload and production file validation.
-2. Split parsed documents into searchable chunks.
-3. Generate embeddings and persist them in a vector database.
-4. Retrieve relevant chunks for a user question.
-5. Connect retrieval context to an LLM and return a cited answer.
-6. Add tests for chunking, retrieval quality, and answer generation.
-
----
-
-# Step 2 — Document Ingestion and Parsing
-
-## 1. Goal
-
-The goal of Step 2 is to implement a reusable document loader that reads external files, extracts text, and preserves metadata.
-
-Supported document formats:
-
-- PDF (`.pdf`)
-- Plain text (`.txt`)
-- Markdown (`.md`)
-
-The loader converts these formats into a common Python data structure called `ParsedDocument`.
-
-This prepares our documents for the next stages of RAG: chunking, embedding generation, and retrieval.
-
-## 2. What is Document Ingestion?
-
-Document ingestion is the process of loading data from external sources into an application for processing.
-
-In a RAG system, documents provide the external knowledge that an LLM will later use to answer questions.
-
-The complete ingestion pipeline is:
-
-**Documents → Parsing → Chunking → Embeddings → Vector Database**
-
-In Step 2, we implement only the first two operations:
-
-**Documents → Parsing**
-
-Example:
-
-Input: `company_policy.pdf`
-
-Output:
-
-- Extracted document text
-- Original filename
-- File format
-- Total number of PDF pages
-- Page number associated with each extracted section
-
-We do not generate embeddings or store documents in a database yet.
-
-## 3. What is Document Parsing?
-
-Parsing is the process of extracting useful content from a file and converting it into a format the application can process.
-
-Different document formats require different parsing techniques.
-
-### TXT files
-
-A TXT file contains plain text.
-
-Python can read it directly using `Path.read_text()`.
-
-Example:
-
-`path.read_text(encoding="utf-8")`
-
-The `encoding="utf-8"` parameter tells Python how to decode the file's bytes into text.
-
-### Markdown files
-
-Markdown files also contain plain text, but include formatting syntax such as headings, lists, and links.
-
-Example:
-
-`# RAG Introduction`
-
-Our current loader reads Markdown as text and preserves its Markdown syntax.
-
-It does not convert Markdown into HTML or extract its semantic structure.
-
-### PDF files
-
-PDF files have a more complex internal representation.
-
-We use the `pypdf` library to extract text from individual PDF pages.
-
-Important operations:
-
-- `PdfReader(file)` — Opens and parses the PDF.
-- `reader.pages` — Provides access to PDF pages.
-- `page.extract_text()` — Attempts to extract text from a page.
-- `len(reader.pages)` — Returns the total number of pages.
-
-A limitation of `pypdf` is that it does not perform OCR (Optical Character Recognition).
-
-Therefore, scanned PDFs containing only images cannot currently be processed successfully unless they also contain an extractable text layer.
-
-## 4. Project Architecture
-
-We introduced two important packages:
-
-**Domain layer**
-
-`app/domain/documents.py`
-
-Contains the data models that represent parsed documents.
-
-**Infrastructure layer**
-
-`app/infrastructure/document_loader.py`
-
-Contains the implementation responsible for reading and parsing physical files.
-
-Project structure:
-
-```text
-app/
-├── __init__.py
-├── main.py
-├── domain/
-│   ├── __init__.py
-│   └── documents.py
-└── infrastructure/
-    ├── __init__.py
-    └── document_loader.py
-```
-
-### Why separate Domain and Infrastructure?
-
-The domain layer describes what our application works with.
-
-The infrastructure layer describes how the application interacts with external systems.
-
-For example:
-
-The domain knows that a document contains text, a filename, and metadata.
-
-It does not need to know whether that text came from a PDF, a database, or a remote API.
-
-This design follows the Separation of Concerns principle.
-
-Benefits include:
-
-- Easier unit testing
-- Better maintainability
-- Clear responsibilities
-- Reduced coupling
-- Easier replacement of external libraries
-
-This is part of our gradual transition toward a modular, senior-level application architecture.
-
-## 5. Document Data Models
-
-We created two models using Python's `dataclasses` module.
-
-### DocumentSection
-
-Represents a section of extracted document content.
-
-Fields:
-
-- `text: str` — Extracted text
-- `page_number: int | None` — Original PDF page number, when available
-
-The page number is optional because TXT and Markdown files do not have PDF-style pages.
-
-For PDF files, our initial implementation creates one section per page that contains extractable, non-empty text.
-
-### ParsedDocument
-
-Represents an entire parsed document.
-
-Fields:
-
-- `filename` — Original filename
-- `file_type` — File extension without the dot
-- `sections` — Tuple of extracted DocumentSection objects
-- `page_count` — Total PDF page count, or None for TXT/Markdown
-
-### Why use @dataclass?
-
-The `@dataclass` decorator automatically generates useful methods for classes primarily intended to store data.
-
-These include an initializer and a representation method.
-
-This reduces boilerplate code.
-
-### Why use frozen=True?
-
-`@dataclass(frozen=True)` prevents normal reassignment of an object's fields after creation.
-
-This is useful because parsed document results should not be accidentally modified during later processing.
-
-It provides shallow immutability, not automatic deep immutability of every possible nested object.
-
-### Why use a tuple?
-
-`ParsedDocument.sections` is stored as a tuple instead of a list.
-
-A tuple cannot have elements added, removed, or replaced after creation.
-
-This works well with immutable document models.
-
-### What is @property?
-
-We defined a `text` property on `ParsedDocument`.
-
-It joins text from all document sections using two newline characters.
-
-This allows us to access:
-
-`document.text`
-
-instead of manually combining every section.
-
-The original sections remain available separately so we can preserve page information during future chunking.
-
-## 6. Document Loader Implementation
-
-Main function:
-
-`load_document(file_path: str | Path) -> ParsedDocument`
-
-The function accepts a filesystem path and returns a structured document object.
-
-### Processing flow
-
-1. Convert the provided path into a `Path` object.
-2. Check whether the file extension is supported.
-3. Verify that the file exists and is a regular file.
-4. Choose the appropriate parser.
-5. Extract text and metadata.
-6. Reject documents without extractable text.
-7. Return a `ParsedDocument`.
-
-### Why use pathlib.Path?
-
-`pathlib` provides an object-oriented way to work with filesystem paths.
-
-Useful operations include:
-
-- `Path(file_path)` — Create a path object.
-- `path.suffix` — Read the file extension.
-- `path.name` — Get the filename.
-- `path.is_file()` — Check whether it is a regular file.
-- `path.read_text()` — Read text content.
-- `path.open()` — Open the file.
-
-Using `pathlib` generally produces clearer, cross-platform filesystem code.
-
-### Why have separate parsing functions?
-
-We use:
-
-- `_load_text()` for TXT and Markdown.
-- `_load_pdf()` for PDF documents.
-
-Different formats require different parsing logic.
-
-Separating these functions improves readability, testing, and maintainability.
-
-The underscore prefix indicates that these functions are intended for internal module use. It does not make them strictly private in Python.
-
-### Why return the same data type?
-
-Both parsers ultimately provide data used to construct a `ParsedDocument`.
-
-This means later RAG components do not need separate processing logic for every file format.
-
-For example, the chunking component will be able to accept a parsed document without knowing which parser created it.
-
-## 7. Metadata and Source Tracking
-
-Metadata describes information about a document beyond its main textual content.
-
-Our current metadata includes:
-
-- Filename
-- File type
-- PDF page count
-- Section page numbers
-
-### Why is metadata important in RAG?
-
-Imagine a user asks:
-
-"What is the company's vacation policy?"
-
-Our retrieval system may find relevant information on page 8 of `employee_handbook.pdf`.
-
-Later, our RAG application can generate an answer with a reference such as:
-
-**Source: employee_handbook.pdf, page 8**
-
-Without preserving source metadata, generating accurate document references becomes more difficult.
-
-### Important distinction
-
-`page_count` represents the total number of pages in a PDF.
-
-`len(document.sections)` represents the number of sections containing extracted text.
-
-These values may differ when a PDF contains blank pages or pages without extractable text.
-
-### Metadata in future steps
-
-Later, we can extend metadata with:
-
-- Document ID
-- Chunk ID
-- Section heading
-- Content hash
-- Upload timestamp
-- Document version
-- Access permissions
-
-These fields will support retrieval filtering, document updates, and security.
-
-## 8. Error Handling
-
-We introduced a custom exception:
-
-`DocumentLoadError(ValueError)`
-
-It represents errors encountered while loading a document.
-
-### Why use a custom exception?
-
-Without custom exceptions, different parsing libraries may raise many unrelated errors.
-
-Our application should have a consistent way to represent document-loading failures.
-
-Examples include:
-
-- Unsupported file format
-- Missing file
-- Empty document
-- Invalid PDF
-- Encrypted PDF
-- Unreadable text file
-
-### Exception chaining
-
-We use the `raise ... from exc` syntax when appropriate.
-
-This preserves the original exception as the cause of our custom exception.
-
-It helps developers understand the underlying problem during debugging.
-
-### Why reject empty documents?
-
-A document without usable text cannot contribute meaningful information to our current text-based RAG pipeline.
-
-Rejecting it early prevents unnecessary processing in later steps.
-
-### Current validation limitations
-
-Checking a file extension does not prove that the actual file content matches the declared type.
-
-We also do not currently enforce file-size limits or resource limits.
-
-These checks will become important when we implement HTTP uploads and production security.
-
-## 9. Automated Testing
-
-We use Pytest to verify document-loader behavior.
-
-Test file:
-
-`tests/test_document_loader.py`
-
-### What is tmp_path?
-
-`tmp_path` is a built-in Pytest fixture.
-
-It provides a temporary directory for an individual test.
-
-This allows us to create test files without modifying real user documents.
-
-It also helps keep tests independent.
-
-### Why use ReportLab?
-
-ReportLab is used only for testing.
-
-It generates real PDF documents containing known text.
-
-Our tests then use `pypdf` to extract that text and verify the results.
-
-This lets us test PDF parsing without depending on external PDF files.
-
-### What do we test?
-
-| Test | Purpose |
-|---|---|
-| test_load_txt | Verify TXT extraction |
-| test_load_markdown | Verify Markdown extraction |
-| test_load_pdf | Verify PDF extraction and page numbers |
-| test_unsupported_format | Reject unsupported extensions |
-| test_missing_file | Handle missing files |
-| test_empty_document | Reject empty text |
-| test_pdf_without_text | Reject PDFs without extractable text |
-
-We also retain the existing FastAPI health test from Step 1.
-
-### Run tests
-
-`python -m pytest -v`
-
-Actual verified result:
-
-**8 passed in 0.60 seconds**
-
-This confirms that all eight current tests passed in the development environment.
-
-It does not mean every possible PDF format or production failure scenario has been tested.
-
-## 10. Dependencies
-
-We introduced two requirements files.
-
-### requirements.txt
-
-Contains direct application dependencies:
-
-- FastAPI
-- Uvicorn
-- PyPDF
-- HTTPX2
-
-### requirements-dev.txt
-
-References `requirements.txt` and adds:
-
-- Pytest
-- ReportLab
-
-The line `-r requirements.txt` tells pip to include the main application requirements.
-
-This separation helps keep development-only tooling distinct from the application's direct runtime dependencies.
-
-We also verified the installed environment using:
-
-`python -m pip check`
-
-Result:
-
-`No broken requirements found.`
-
-## 11. What is __init__.py?
-
-`__init__.py` is a special Python file that identifies a directory as a regular Python package.
-
-In this step, we use it in:
-
-- `app/`
-- `app/domain/`
-- `app/infrastructure/`
-
-It makes package boundaries explicit.
-
-For example:
-
-`from app.domain.documents import ParsedDocument`
-
-Since Python 3.3, implicit namespace packages can also work without `__init__.py`.
-
-Therefore, this file is not always required for imports.
-
-Our Tiny LLM project used module execution with `python -m`, which can work without `__init__.py` when modules are discoverable through Python's import path.
-
-For our RAG project, we intentionally use explicit regular packages because we are building a modular backend application.
-
-Empty `__init__.py` files are valid and should be committed to Git when they are part of the intended package structure.
-
-## 12. Current Limitations
-
-At the end of Step 2:
-
-- Documents are loaded from local filesystem paths.
-- TXT and Markdown parsing expects UTF-8.
-- Scanned PDFs without extractable text are unsupported.
-- Encrypted PDFs are unsupported.
-- Markdown structure is not yet parsed into headings and sections.
-- HTTP document-upload endpoints have not been implemented.
-- File-size and content-validation limits are not implemented.
-- Chunking is not yet implemented.
-- Embeddings and vector storage are not yet implemented.
-
-These limitations are intentional at this stage.
-
-We are building and validating one component at a time.
-
-## 13. Step 2 Final Result
-
-We implemented a reusable document ingestion component with:
-
-- Support for PDF, TXT, and Markdown.
-- Structured domain models.
-- Separation of domain and infrastructure logic.
-- PDF page metadata preservation.
-- Consistent error handling.
-- Automated tests.
-
-**All 8 tests passed successfully.**
-
-Our document loader is now ready to provide extracted content to the future chunking component.
-
-### Key Takeaway
-
-Document ingestion is the foundation of RAG.
-
-Before generating embeddings or performing semantic search, we must reliably extract text and preserve information about its source.
-
-The quality and structure of ingested documents directly influence the quality of retrieval and the accuracy of future source citations.
-
-
----
-
-# Step 3 — Document Chunking
-
-## Goal
-
-Implement multiple text chunking strategies and preserve
-document metadata for future embedding and retrieval.
-
-## 1. What is Chunking?
-
-Chunking divides large documents into smaller text units.
-
-Each chunk can later be converted into an embedding
-and stored in a vector database.
-
-Smaller chunks improve retrieval granularity, but
-excessively small chunks may lose important context.
-
-## 2. Why Do We Need Chunking?
-
-Large documents can exceed embedding model input limits.
-
-Using entire documents as retrieval units can also
-include large amounts of irrelevant text.
-
-Chunking helps isolate relevant passages.
-
-## 3. Chunk Size and Overlap
-
-Chunk size defines the maximum number of characters
-in our current implementation.
-
-Overlap repeats part of the text between consecutive
-chunks from the same source section.
-
-Example:
-
-Text: ABCDEFGHIJKL
-Size: 5
-Overlap: 2
-
-Chunks:
-ABCDE
-DEFGH
-GHIJK
-JKL
-
-Overlap reduces boundary-related context loss but
-increases the amount of processed text.
-
-Character count is different from token count.
-
-## 4. Fixed-size Chunking
-
-Fixed-size chunking splits text into character windows.
-
-Advantages:
-- Simple implementation
-- Predictable maximum size
-- Low processing overhead
-
-Disadvantages:
-- Can split sentences
-- Does not understand document structure
-
-## 5. Recursive Chunking
-
-Our recursive splitter tries separators in priority order:
-
-1. Paragraph boundaries
-2. Newlines
-3. Sentence-like boundaries
-4. Spaces
-5. Character-length fallback
-
-It recursively checks lower-priority boundaries when
-a preferred separator cannot be used.
-
-This is a lightweight boundary-aware approach, not
-a complete linguistic sentence parser.
-
-## 6. Document-aware Chunking
-
-Document-aware chunking uses information about the
-original document's structure.
-
-For Markdown:
-- Identify headings
-- Split at heading boundaries
-- Preserve heading metadata
-
-For PDF:
-- Process extracted pages independently
-- Preserve original page numbers
-
-For TXT:
-- Apply boundary-aware splitting
-
-## 7. Architecture
-
-New files:
-
-app/domain/chunks.py
-app/application/chunking.py
-
-The domain layer defines the DocumentChunk data model.
-
-The application layer implements chunking algorithms.
-
-Chunking depends on domain models but does not depend
-on FastAPI or the PDF parsing library.
-
-## 8. Strategy Design Pattern
-
-Each chunker implements the same interface:
-
-chunk(document) -> list[DocumentChunk]
-
-Implementations:
-
-- FixedSizeChunker
-- RecursiveChunker
-- DocumentAwareChunker
-
-We use a Python Protocol to describe the interface.
-
-This makes chunking strategies interchangeable.
-
-## 9. Configuration Validation
-
-ChunkingSettings stores:
-
-- size
-- overlap
-
-Validation ensures:
-
-- size > 0
-- overlap >= 0
-- overlap < size
-
-This prevents invalid window calculations.
-
-## 10. Metadata Preservation
-
-Each DocumentChunk contains:
-
-- text
-- filename
-- file_type
-- page_number
-- chunk_index
-- strategy
-- heading
-
-Metadata allows future retrieval results to reference
-their source documents.
-
-Chunk indices are sequential within one chunking result.
-They are not yet persistent database identifiers.
-
-## 11. Testing
-
-We test:
-
-- Fixed-size splitting
-- Overlapping chunks
-- Recursive paragraph boundaries
-- Character-boundary fallback
-- Chunk-length limits
-- Markdown headings
-- PDF page metadata
-- Invalid configuration
-- Empty content
-
-Step 3 adds 12 test cases.
-
-Expected complete test suite:
-20 passed.
-
-## 12. Current Limitations
-
-- Chunk sizes are measured in characters, not tokens.
-- Boundary detection uses simple text rules.
-- Markdown handling supports basic ATX headings.
-- PDFs use extracted page boundaries.
-- No semantic chunking is implemented yet.
-- Chunks are not stored in a database.
-- Embeddings are not generated.
-- No retrieval evaluation has been performed.
-
-These are deliberate scope limitations for this step.
-
-## 13. Step 3 Result
-
-We now have three interchangeable chunking strategies
-that produce structured DocumentChunk objects.
-
-The chunking engine works with ParsedDocument objects
-created by the document loader from Step 2.
-
-The next step introduces embedding generation and
-vector similarity.
-
-## Key Takeaway
-
-Chunking is not simply splitting text.
-
-The strategy affects which information stays together,
-how much context is preserved, and what the retrieval
-system can find later.
-
-Chunking choices should ultimately be evaluated using
-real questions and retrieval-quality measurements.
-
-
----
-
-# Step 4 — Embedding Generation and Vector Similarity
-
-## Goal
-
-Convert document chunks and user questions into numerical
-vectors and compare them using cosine similarity.
-
-## 1. What is an embedding?
-
-An embedding is a numerical representation of text.
-
-Embedding models are trained to place semantically related
-texts near one another in a multidimensional vector space.
-
-Example:
-
-"How do I reset my password?"
-
-The embedding model returns a vector such as:
-
-[0.12, -0.35, 0.81, ...]
-
-The values are learned representations, not manually
-assigned meanings.
-
-## 2. What is an embedding model?
-
-An embedding model converts input text into vectors.
-
-We use:
-
-sentence-transformers/all-MiniLM-L6-v2
-
-It generates 384-dimensional embeddings.
-
-The model runs locally using PyTorch and CPU inference.
-
-The model has a maximum input length of 256 tokens.
-Longer inputs may be truncated.
-
-## 3. What are vector dimensions?
-
-Dimensions are the number of numerical elements in
-an embedding.
-
-For our model:
-
-1 text -> 384 floating-point numbers
-
-Both document chunks and user questions must be embedded
-using compatible embedding models.
-
-Their vectors must have matching dimensions.
-
-## 4. Why embed document chunks?
-
-After chunking, documents still contain ordinary text.
-
-Embedding generation converts those chunks into
-numerical representations suitable for similarity search.
-
-Pipeline:
-
-Document -> Chunks -> Embeddings
-
-The next step will store these embeddings in PostgreSQL
-using pgvector.
-
-## 5. What is cosine similarity?
-
-Cosine similarity measures the directional similarity
-between two numerical vectors.
-
-Its mathematical range is from -1 to 1.
-
-1 means the same direction.
-0 means orthogonal vectors.
--1 means opposite directions.
-
-A high similarity score does not guarantee that a chunk
-correctly answers a question.
-
-## 6. What is vector normalization?
-
-Normalization adjusts a nonzero vector to unit length.
-
-With unit-length vectors, their dot product equals
-their cosine similarity.
-
-We request normalized embeddings from
-Sentence Transformers.
-
-## 7. Architecture
-
-New files:
-
-app/domain/embeddings.py
-app/application/embeddings.py
-app/infrastructure/sentence_transformer_embeddings.py
-
-The domain defines EmbeddedChunk and EmbeddingProvider.
-
-The application layer coordinates vector generation
-and implements similarity calculations.
-
-The infrastructure layer integrates Sentence Transformers.
-
-## 8. What is EmbeddingProvider?
-
-EmbeddingProvider is a Python Protocol.
-
-It defines the method:
-
-encode(texts) -> list[Vector]
-
-Our application can use different embedding providers
-without depending directly on their libraries.
-
-This supports Dependency Inversion and testability.
-
-## 9. How does embed_chunks() work?
-
-1. Receive DocumentChunk objects.
-2. Validate that chunk text is not empty.
-3. Send the text to the embedding provider.
-4. Validate the returned vectors.
-5. Create EmbeddedChunk objects.
-6. Preserve the original chunk metadata.
-
-## 10. Why validate vectors?
-
-Embedding generation is an external dependency.
-
-Our application checks:
-
-- The returned vector count
-- Consistent vector dimensions
-- Nonempty vectors
-- Finite numerical values
-
-This helps detect malformed provider responses.
-
-## 11. How does embed_query() work?
-
-It converts a user question into an embedding.
-
-The same model used for document chunks is used
-for the query.
-
-Later, retrieval will compare query embeddings
-against stored document embeddings.
-
-## 12. What is in-memory similarity search?
-
-We can compare a question against document embeddings
-without a database.
-
-The process:
-
-Question -> Embedding -> Cosine Similarity -> Ranking
-
-This works for small examples.
-
-A vector database becomes useful for persistent storage,
-filtering, indexing, and larger document collections.
-
-## 13. How do we test embeddings?
-
-Unit tests use a fake embedding provider.
-
-This avoids downloading a real model during automated
-tests and produces predictable test results.
-
-We separately run a manual integration example using
-the real pretrained embedding model.
-
-Step 4 adds 16 test cases.
-
-Expected total project test count: 36.
-
-## 14. Current limitations
-
-- No persistent vector database
-- No vector indexing
-- No document upload API
-- No LLM answer generation
-- No source-aware retrieval service
-- Character-based rather than token-aware chunking
-- No embedding model version stored with vectors
-- No formal semantic retrieval evaluation
-- No automated real-model integration test
-
-The local model also has input-length and language
-limitations. It is primarily suitable for English text.
-
-## 15. Step 4 Result
-
-The project now supports:
-
-- Local text embedding generation
-- Query embedding generation
-- Structured EmbeddedChunk objects
-- Vector validation
-- Cosine similarity
-- Small in-memory similarity comparisons
-
-## Key Takeaway
-
-Embeddings transform text into vectors that allow
-computers to compare semantic similarity.
-
-Chunking determines which text is represented.
-
-The embedding model determines how that text is
-represented numerically.
-
-The retrieval system will use those representations
-to identify relevant information.
-
-Next: Step 5 — PostgreSQL and pgvector.
-
-
----
-
-# Step 5 — PostgreSQL and pgvector
-
-## Goal
-
-Persist documents, chunks, and embeddings in PostgreSQL,
-then perform similarity search directly in the database.
-
-## 1. Why do we need a vector database?
-
-In Step 4, embeddings were stored only in Python memory.
-
-When the Python process ended, those embeddings were lost.
-
-We also needed to calculate similarities against every
-chunk in Python.
-
-A vector database provides persistent storage and
-database-level similarity operations.
-
-## 2. What is pgvector?
-
-pgvector is a PostgreSQL extension for vector storage
-and similarity search.
-
-It adds:
-
-- Vector column types
-- Vector similarity operators
-- Distance calculations
-- Approximate nearest-neighbor indexes
-
-We can combine ordinary relational data and embeddings
-in the same database.
-
-## 3. Our database schema
-
-We created two tables:
-
-documents:
-- id
-- filename
-- file_type
-- embedding_model
-- created_at
-
-document_chunks:
-- id
-- document_id
-- chunk_index
-- text
-- page_number
-- heading
-- strategy
-- embedding
-
-Relationship:
-
-One document -> Many document chunks
-
-Each chunk has a foreign key referencing its source
-document.
-
-Deleting a document cascades to its chunks.
-
-## 4. What is VECTOR(384)?
-
-VECTOR is a pgvector data type.
-
-384 specifies the number of dimensions.
-
-Our Sentence Transformers model generates
-384-dimensional embeddings.
-
-The database expects each stored vector to have
-exactly this number of dimensions.
-
-A different embedding model may require a different
-schema or storage strategy.
-
-## 5. What is SQLAlchemy?
-
-SQLAlchemy is a Python database toolkit and ORM.
-
-It lets us map Python classes to database tables and
-construct SQL queries using Python expressions.
-
-Our ORM models are separate from our domain models.
-
-Domain models represent application concepts.
-
-ORM models represent database storage.
-
-## 6. What is Psycopg?
-
-Psycopg is a PostgreSQL driver for Python.
-
-SQLAlchemy uses it to communicate with PostgreSQL.
-
-Our connection URL uses the psycopg dialect:
-
-postgresql+psycopg://...
-
-## 7. What is Alembic?
-
-Alembic manages database schema migrations.
-
-Every migration describes a version-controlled change
-to the database structure.
-
-Important commands:
-
-alembic upgrade head
-alembic current
-alembic history
-
-We use migrations instead of manually creating tables.
-
-## 8. What is the Repository pattern?
-
-A repository encapsulates database persistence and
-retrieval operations.
-
-Our PgvectorRepository provides:
-
-save_document()
-search()
-
-Application services do not need to know the underlying
-SQL expressions.
-
-The repository receives a SQLAlchemy Session.
-
-The caller controls transaction boundaries.
-
-## 9. What is a database transaction?
-
-A transaction groups database changes into a single
-logical operation.
-
-For example, saving a document may insert:
-
-- One document record
-- Multiple chunk records
-- Multiple associated vectors
-
-These inserts should succeed together.
-
-If an error occurs, the transaction can roll back
-the changes instead of leaving partially saved data.
-
-## 10. What is cosine distance?
-
-In Step 4, we calculated cosine similarity in Python.
-
-pgvector supports cosine distance with:
-
-embedding <=> query_vector
-
-To calculate similarity:
-
-similarity = 1 - cosine_distance
-
-A lower distance indicates vectors pointing in more
-similar directions.
-
-A higher cosine similarity indicates more similar
-vector directions.
-
-Similarity is not a probability of correctness.
-
-## 11. What is nearest-neighbor search?
-
-Nearest-neighbor search retrieves vectors closest to
-a query vector according to a distance metric.
-
-Our workflow:
-
-1. User submits a question.
-2. The embedding model generates a query vector.
-3. PostgreSQL compares it with stored chunk vectors.
-4. Results are ordered by cosine distance.
-5. The most similar chunks are returned.
-
-This step uses exact vector search.
-
-Approximate nearest-neighbor indexing will be evaluated
-when the dataset becomes large enough to justify it.
-
-## 12. Why save the embedding model name?
-
-Different embedding models may produce incompatible
-representations.
-
-Even models with the same number of dimensions may
-represent semantic relationships differently.
-
-We associate documents with their embedding model and
-filter retrieval by model name.
-
-For stronger reproducibility, future steps can track
-an exact model revision and embedding configuration.
-
-## 13. Why use Docker Compose?
-
-Docker Compose provides a repeatable local database
-environment.
-
-Our PostgreSQL database runs in a separate container.
-
-The database uses host port 5433 to avoid conflicts
-with other local PostgreSQL projects.
-
-A named Docker volume preserves database files
-between normal container restarts.
-
-## 14. Why use separate databases for testing?
-
-Integration tests should not modify real application
-data.
-
-We use:
-
-rag_documents       - Development database
-rag_documents_test  - Integration testing database
-
-This prevents test data from interfering with
-development documents.
-
-## 15. What do our tests verify?
-
-The new integration test checks:
-
-- Document persistence
-- Vector persistence
-- Database transactions
-- Retrieval in a new database session
-- Cosine similarity ordering
-- Original source metadata
-- Cleanup after testing
-
-Existing unit tests remain independent of PostgreSQL.
-
-Expected complete test count: 37.
-
-## 16. Current limitations
-
-- No document upload REST endpoint yet
-- No dedicated retrieval application service
-- No HNSW or IVFFlat index yet
-- No hybrid search
-- No reranking
-- No automatic document deduplication
-- No reindexing workflow
-- No authentication or access control
-- No production database backup configuration
-- No LLM answer generation
-
-These are planned improvements, not completed features.
-
-## 17. Step 5 Result
-
-We have connected the components built so far:
-
-Document -> Parsing -> Chunking -> Embeddings
--> PostgreSQL + pgvector -> Similarity Search
-
-Our application can now persist embeddings and search
-them after the original Python process has finished.
-
-## Key Takeaway
-
-PostgreSQL with pgvector combines traditional relational
-storage with numerical similarity search.
-
-A vector database is not responsible for understanding
-documents or generating embeddings.
-
-Those responsibilities belong to our document-processing
-and embedding components.
-
-The database stores the resulting information and
-retrieves the most relevant vectors when queried.
-
-
----
-
-# Step 6 — Semantic Retrieval
-
-## Goal
-
-Implement a dedicated retrieval service that connects
-user questions to stored document embeddings.
-
-The service generates query embeddings, searches PostgreSQL,
-filters results, and prepares context for an LLM.
-
-## 1. What is Semantic Retrieval?
-
-Semantic retrieval searches for information based on
-meaning rather than exact keyword matching.
-
-It compares the vector representation of a question
-against stored document embeddings.
-
-Semantically related questions and documents tend
-to have similar embeddings.
-
-## 2. Retrieval Pipeline
-
-Question
-    |
-    v
-Embedding Model
-    |
-    v
-Query Vector
-    |
-    v
-PostgreSQL + pgvector
-    |
-    v
-Ranked Document Chunks
-    |
-    v
-Similarity Filtering
-    |
-    v
-Context Assembly
-
-This step does not generate an LLM answer.
-
-## 3. What is Top-K?
-
-Top-K defines the maximum number of search results
-returned by the retrieval system.
-
-Example:
-
-top_k = 3
-
-The database returns the three nearest matching chunks,
-assuming at least three results are available.
-
-Our application accepts top_k values from 1 to 50.
-
-## 4. What is a Similarity Threshold?
-
-A similarity threshold allows us to remove results
-below a specified cosine similarity value.
-
-Example:
-
-min_similarity = 0.5
-
-Only results with similarity >= 0.5 are returned.
-
-Thresholds should be evaluated against real documents
-and questions. A single threshold is not universally
-correct across embedding models and datasets.
-
-Our default is None, which disables threshold filtering.
-
-## 5. What is Metadata Filtering?
-
-Metadata filtering limits which documents can
-participate in retrieval.
-
-We currently support filtering by document_id.
-
-The PostgreSQL repository applies the document
-filter before returning nearest neighbors.
-
-Later, we can introduce additional filters such
-as document type, owner, and access permissions.
-
-## 6. What is Context Assembly?
-
-Context assembly prepares retrieved information
-for the LLM.
-
-Each retrieved chunk contains:
-
-- Original text
-- Document UUID
-- Source filename
-- Page number, when available
-- Heading, when available
-
-We format the evidence into source-labeled sections.
-
-This context will be passed to an LLM in Step 7.
-
-## 7. Why Preserve Source References?
-
-Source references let us trace retrieved information
-back to its original document.
-
-For example:
-
-Source [1]
-File: company_policy.pdf
-Page: 5
-
-An LLM can later refer to these source labels.
-
-We still need to validate that generated citations
-actually support the answer.
-
-## 8. RetrievalService
-
-The RetrievalService coordinates retrieval.
-
-Its responsibilities:
-
-1. Validate the user question.
-2. Generate the query embedding.
-3. Search the vector database.
-4. Apply optional similarity filtering.
-5. Assemble source-labeled context.
-6. Return structured retrieval results.
-
-The service does not know how PostgreSQL performs
-similarity calculations internally.
-
-## 9. ChunkSearchRepository
-
-ChunkSearchRepository is a Python Protocol.
-
-It defines the database operations required by
-the retrieval service.
-
-Our existing PgvectorRepository satisfies
-this interface through structural typing.
-
-This follows the Dependency Inversion Principle.
-
-The application depends on an abstraction rather
-than a specific database implementation.
-
-## 10. RetrievalResult
-
-RetrievalResult contains:
-
-- question
-- matches
-- context
-
-It also exposes has_results to indicate whether
-any evidence was retrieved.
-
-If no matches are found, context is an empty string.
-
-The application does not invent missing evidence.
-
-## 11. Why Use Dependency Injection?
-
-We pass the embedding provider and repository
-into the RetrievalService constructor.
-
-This allows us to use fake dependencies in tests
-and real dependencies in production.
-
-We can replace an embedding provider or database
-implementation without rewriting retrieval logic.
-
-## 12. How Does PostgreSQL Search Work?
-
-Our repository uses cosine distance.
-
-The pgvector cosine-distance operator is:
-
-<=>
-
-Cosine similarity is calculated as:
-
-1 - cosine_distance
-
-Results are ordered by ascending cosine distance.
-
-The repository also filters by embedding model.
-
-This avoids mixing incompatible embeddings.
-
-## 13. Automated Testing
-
-Step 6 adds 12 unit test cases.
-
-Tests verify:
-
-- Query embedding
-- Repository parameters
-- Top-K forwarding
-- Document filtering
-- Similarity threshold filtering
-- Context formatting
-- Empty-result handling
-- Invalid input validation
-
-We use fake providers and repositories to avoid
-requiring a live database during unit tests.
-
-The previous PostgreSQL integration test remains
-part of the complete test suite.
-
-Expected complete test count: 49.
-
-## 14. Current Limitations
-
-- Retrieval uses semantic vector search only.
-- No BM25 or hybrid search.
-- No reranking.
-- No query rewriting.
-- No LLM-generated answers.
-- No REST question-answering endpoint.
-- No authentication or document permissions.
-- No token-budget-based context assembly.
-- No retrieval quality benchmark yet.
-
-Retrieved document text is untrusted data.
-
-In future LLM prompts, source content must be treated
-as evidence, not as instructions to the model.
-
-## 15. Step 6 Result
-
-Our application can now:
-
-1. Accept a question.
-2. Generate a query embedding.
-3. Search previously stored document embeddings.
-4. Retrieve ranked source chunks.
-5. Filter results.
-6. Prepare structured evidence for an LLM.
-
-## Key Takeaway
-
-Embedding generation converts questions into vectors.
-
-A vector database finds similar stored vectors.
-
-A retrieval service coordinates those operations
-and prepares the evidence for generation.
-
-Retrieval quality directly affects the quality
-of the final RAG answer.
-
-
-
+Run the API with `python -m uvicorn app.main:app --reload` and tests with
+`python -m pytest -v`. The development requirements include Pytest and
+ReportLab; ReportLab is used to create deterministic PDFs for loader tests and
+is not needed by the runtime application.
+
+## Known limitations and next steps
+
+- The API does not yet expose upload, retrieval, or answer endpoints.
+- Documents are loaded from local filesystem paths and text files expect UTF-8.
+- Scanned PDFs need an OCR stage that is not present yet.
+- File size, content sniffing, and upload security limits are not implemented.
+- Retrieval is semantic-only; hybrid retrieval and reranking are future work.
+- Retrieval and answer quality need a formal evaluation suite.
+- Authentication, observability, CI/CD, and deployment configuration are
+  future work.
+
+The current design keeps these additions localized: HTTP adapters can call the
+existing application services, while new retrievers or generators can satisfy
+the existing domain protocols.

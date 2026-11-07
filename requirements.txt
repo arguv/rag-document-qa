@@ -9,3 +9,4 @@ psycopg[binary]==3.3.8
 alembic==1.20.1
 pgvector==0.5.1
 python-dotenv==1.2.4
+openai==3.46.0
