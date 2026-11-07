@@ -9,7 +9,8 @@ replaced independently.
 
 The repository currently contains:
 
-- a FastAPI application with `GET /health`;
+- a FastAPI application with health, readiness, document, search, question,
+  Swagger, OpenAPI, and metrics endpoints;
 - PDF, TXT, and Markdown document loading;
 - immutable document and chunk domain models;
 - fixed-size, recursive, and Markdown-aware chunking;
@@ -18,10 +19,13 @@ The repository currently contains:
 - semantic retrieval with top-k, document, and similarity filtering;
 - source-labeled retrieval context;
 - an OpenAI Responses API answer generator using structured output; and
-- an answer service that validates answerability and citations.
+- an answer service that validates answerability and citations;
+- optional hybrid retrieval, reranking, query decomposition, neighboring
+  context, offline evaluation, and bounded agentic retry; and
+- API boundary controls, Docker Compose deployment files, and CI.
 
-HTTP upload, retrieval, and question-answering endpoints are intentionally not
-implemented yet. The current workflows are exercised through `scripts/`.
+HTTP upload, retrieval, question answering, document management and operational
+endpoints are implemented in `app/api/`. Scripts remain available as demos.
 
 ## What is RAG?
 
@@ -187,11 +191,23 @@ DATABASE_URL=postgresql+psycopg://rag_user:rag_local_password@127.0.0.1:5433/rag
 TEST_DATABASE_URL=postgresql+psycopg://rag_user:rag_local_password@127.0.0.1:5433/rag_documents_test
 OPENAI_API_KEY=replace_with_your_api_key
 OPENAI_MODEL=gpt-6-luna
+LLM_BACKEND=mock
+APP_ENV=development
+API_KEY=
+MAX_UPLOAD_BYTES=10485760
+MAX_DOCUMENT_CHARS=2000000
+RATE_LIMIT_PER_MINUTE=60
+MAX_CONCURRENT_REQUESTS=8
+BM25_MAX_CHUNKS=20000
+RERANKER_MODEL=
 ```
 
-The database URL is required by the database session factory. A valid OpenAI
-key is required only by `OpenAIAnswerGenerator` and the step 7 demo. Use an
-OpenAI model name available in your account.
+The database URL is required by the database session factory. `LLM_BACKEND=mock`
+is the default and makes no provider calls. Set `LLM_BACKEND=openai` and provide
+a valid key to use `OpenAIAnswerGenerator`; use a model name available in your
+account. `API_KEY` protects data, readiness, and metrics routes when set, and
+is mandatory when `APP_ENV=production`. The request, document, concurrency, and
+rate settings are safety bounds rather than quality guarantees.
 
 ## Running the implementation
 
@@ -217,17 +233,35 @@ Run the API with `python -m uvicorn app.main:app --reload` and tests with
 ReportLab; ReportLab is used to create deterministic PDFs for loader tests and
 is not needed by the runtime application.
 
-## Known limitations and next steps
+## HTTP API behavior
 
-- The API does not yet expose upload, retrieval, or answer endpoints.
-- Documents are loaded from local filesystem paths and text files expect UTF-8.
-- Scanned PDFs need an OCR stage that is not present yet.
-- File size, content sniffing, and upload security limits are not implemented.
-- Retrieval is semantic-only; hybrid retrieval and reranking are future work.
-- Retrieval and answer quality need a formal evaluation suite.
-- Authentication, observability, CI/CD, and deployment configuration are
-  future work.
+`POST /documents` accepts PDF, TXT, and Markdown multipart uploads. `POST
+/search` returns source-labeled retrieval matches and context; `POST
+/questions` returns a cited answer. Both accept vector or hybrid search,
+document scoping, cosine thresholds, optional reranking, multi-query retrieval,
+neighbor expansion, and bounded agentic retry. `GET /ready` checks the database
+without loading models. `GET /metrics` reports process-local request counts and
+duration. Health, Swagger, and the OpenAPI schema are public; the other routes
+are protected by `X-API-Key` when `API_KEY` is configured.
 
-The current design keeps these additions localized: HTTP adapters can call the
-existing application services, while new retrievers or generators can satisfy
-the existing domain protocols.
+## Known limitations
+
+Text documents expect UTF-8. Scanned PDFs require a separate OCR stage. Exact
+BM25 is bounded by `BM25_MAX_CHUNKS`, and operational counters/rate limits are
+process-local. HNSW is approximate and selective filters may reduce recall.
+Authentication is one shared key over one shared corpus; document UUIDs are
+filters, not tenant permissions. There is no chat memory, distributed job
+queue, external-tool agent, automated factuality judge, or production load
+certification.
+
+## Steps 8–15 implementation
+
+`app/api/routes.py` exposes ingestion and retrieval through FastAPI, reusing the existing document loader, chunker, embedding provider, pgvector repository and citation validator. Database sessions are request-scoped; successful ingestion/deletion commits, while failures close the session and roll back. Uploaded paths are discarded, temporary files are cleaned, and source filenames are restored on parsed document metadata. `app/api/dependencies.py` lazily caches the database engine, embedding model, optional reranker and generator. Search does not initialize an LLM client.
+
+`SearchPipeline` obtains extra vector candidates, optionally decomposes compound questions, calculates exact BM25 against model/document-scoped stored chunks and combines ranks using RRF (constant 60). An optional cross-encoder reorders candidates. The final stage expands adjacent chunks, deduplicates evidence and trims the assembled source-labeled context to 12,000 characters. Fusion does not replace the cosine similarity field. A requested minimum cosine threshold is explicitly computed for lexical candidates. Context neighbors can have lower relevance because they provide surrounding text.
+
+`AgenticAnswerService` is a compiled LangGraph state machine with conditional routing. Empty evidence triggers one broader retrieval with twice the top K (capped at 50) and no similarity threshold. The document scope remains unchanged. Generation runs once through `AnswerService.answer_retrieval`, so the same refusal and citation checks apply. This is a bounded adaptive retrieval workflow, not an autonomous general-purpose agent.
+
+`application/evaluation.py` and `scripts/evaluate.py` compute deterministic retrieval and answer-overlap metrics from JSONL exports. They perform no API calls and do not establish semantic faithfulness. The example data is synthetic. Security and operational boundaries live in `api/security.py`: body caps apply before multipart parsing, authentication uses constant-time key comparison, request IDs are generated server-side, and logs omit questions, document content and provider payloads. Metrics and rate limits are bounded, process-local state.
+
+Migration 0002 adds model filtering and cosine HNSW indexes. Database connections and statements have time limits. The Dockerfile runs as a non-root user; the optional Compose overlay gates startup on migrations. GitHub Actions provisions pgvector, migrates the isolated test database, runs tests and builds the container. Deployment configuration is implemented; successful remote deployment and production behavior still require environment-specific verification. See the README for all commands, knobs and limits.

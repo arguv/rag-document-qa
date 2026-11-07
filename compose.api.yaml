@@ -1,0 +1,30 @@
+services:
+  migrate:
+    build: .
+    command: [alembic, upgrade, head]
+    environment:
+      DATABASE_URL: postgresql+psycopg://rag_user:rag_local_password@db:5432/rag_documents
+    depends_on:
+      db:
+        condition: service_healthy
+  api:
+    build: .
+    restart: unless-stopped
+    ports: ['127.0.0.1:8000:8000']
+    environment:
+      DATABASE_URL: postgresql+psycopg://rag_user:rag_local_password@db:5432/rag_documents
+      LLM_BACKEND: ${LLM_BACKEND:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6-luna}
+      API_KEY: ${API_KEY:?Set API_KEY in .env before starting the API stack}
+      APP_ENV: production
+      LANGSMITH_TRACING: 'false'
+    volumes:
+      - model_cache:/home/rag/.cache/huggingface
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    security_opt: ['no-new-privileges:true']
+    cap_drop: [ALL]
+volumes:
+  model_cache:

@@ -150,3 +150,47 @@ class PgvectorRepository:
             )
             for row in rows
         ]
+
+    def corpus(self, model_name, document_id=None):
+        """Exact BM25 corpus. Fail explicitly rather than silently truncate rankings."""
+        import os
+        statement = select(StoredChunk, StoredDocument.filename).join(StoredDocument).where(
+            StoredDocument.embedding_model == model_name)
+        if document_id is not None:
+            statement = statement.where(StoredChunk.document_id == document_id)
+        cap = int(os.getenv('BM25_MAX_CHUNKS', '20000'))
+        rows = self.session.execute(statement.order_by(StoredChunk.id).limit(cap + 1)).all()
+        if len(rows) > cap:
+            raise RuntimeError('BM25 corpus limit exceeded; use document filtering or a dedicated search backend')
+        return [SearchMatch(chunk.document_id, filename, chunk.text, chunk.page_number,
+                            chunk.heading, chunk.chunk_index, 0.0) for chunk, filename in rows]
+
+    def score_candidates(self, matches, query_vector):
+        from dataclasses import replace
+        from app.application.embeddings import cosine_similarity
+        if not matches:
+            return []
+        from sqlalchemy import tuple_
+        keys = [(item.document_id, item.chunk_index) for item in matches]
+        rows = self.session.execute(select(StoredChunk).where(
+            tuple_(StoredChunk.document_id, StoredChunk.chunk_index).in_(keys))).scalars()
+        vectors = {(row.document_id, row.chunk_index): row.embedding for row in rows}
+        return [replace(item, similarity=cosine_similarity(query_vector, vectors[(item.document_id, item.chunk_index)])) for item in matches]
+
+    def expand_neighbors(self, matches, model_name):
+        from sqlalchemy import or_, and_
+        clauses = [and_(StoredChunk.document_id == m.document_id,
+                        StoredChunk.chunk_index.between(max(0, m.chunk_index - 1), m.chunk_index + 1)) for m in matches]
+        rows = self.session.execute(select(StoredChunk, StoredDocument.filename).join(StoredDocument).where(
+            StoredDocument.embedding_model == model_name, or_(*clauses))).all()
+        by_key = {(chunk.document_id, chunk.chunk_index): SearchMatch(chunk.document_id, filename, chunk.text,
+                   chunk.page_number, chunk.heading, chunk.chunk_index, 0.0) for chunk, filename in rows}
+        expanded, seen = [], set()
+        for match in matches:
+            # Evidence hits precede their neighbors when the context budget is tight.
+            for key in [(match.document_id, match.chunk_index), (match.document_id, match.chunk_index - 1),
+                        (match.document_id, match.chunk_index + 1)]:
+                if key in by_key and key not in seen:
+                    expanded.append(match if key == (match.document_id, match.chunk_index) else by_key[key])
+                    seen.add(key)
+        return expanded

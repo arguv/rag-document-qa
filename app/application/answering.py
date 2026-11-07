@@ -2,6 +2,7 @@
 from uuid import UUID
 
 from app.application.retrieval import RetrievalService
+from app.domain.retrieval import RetrievalResult
 from app.domain.generation import (
     AnswerCitation,
     AnswerGenerator,
@@ -40,6 +41,10 @@ class AnswerService:
             min_similarity=min_similarity,
         )
 
+        return self.answer_retrieval(retrieval)
+
+    def answer_retrieval(self, retrieval: RetrievalResult) -> AnswerResult:
+        """Generate and validate citations against a prepared retrieval result."""
         # No evidence: do not call the LLM.
         if not retrieval.has_results:
             return self._insufficient(retrieval.question)

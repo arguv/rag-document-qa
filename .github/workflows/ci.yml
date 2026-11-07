@@ -1,0 +1,34 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg17
+        env:
+          POSTGRES_USER: rag_user
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: rag_documents_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd 'pg_isready -U rag_user -d rag_documents_test'
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://rag_user:ci_password@localhost:5432/rag_documents_test
+      TEST_DATABASE_URL: postgresql+psycopg://rag_user:ci_password@localhost:5432/rag_documents_test
+      LLM_BACKEND: mock
+      LANGSMITH_TRACING: 'false'
+      HF_HUB_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -r requirements-dev.txt
+      - run: pip check
+      - run: alembic upgrade head
+      - run: pytest -q
+      - run: docker build -t rag-document-qa:ci .
