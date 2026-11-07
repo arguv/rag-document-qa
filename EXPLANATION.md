@@ -1373,3 +1373,267 @@ The database stores the resulting information and
 retrieves the most relevant vectors when queried.
 
 
+---
+
+# Step 6 — Semantic Retrieval
+
+## Goal
+
+Implement a dedicated retrieval service that connects
+user questions to stored document embeddings.
+
+The service generates query embeddings, searches PostgreSQL,
+filters results, and prepares context for an LLM.
+
+## 1. What is Semantic Retrieval?
+
+Semantic retrieval searches for information based on
+meaning rather than exact keyword matching.
+
+It compares the vector representation of a question
+against stored document embeddings.
+
+Semantically related questions and documents tend
+to have similar embeddings.
+
+## 2. Retrieval Pipeline
+
+Question
+    |
+    v
+Embedding Model
+    |
+    v
+Query Vector
+    |
+    v
+PostgreSQL + pgvector
+    |
+    v
+Ranked Document Chunks
+    |
+    v
+Similarity Filtering
+    |
+    v
+Context Assembly
+
+This step does not generate an LLM answer.
+
+## 3. What is Top-K?
+
+Top-K defines the maximum number of search results
+returned by the retrieval system.
+
+Example:
+
+top_k = 3
+
+The database returns the three nearest matching chunks,
+assuming at least three results are available.
+
+Our application accepts top_k values from 1 to 50.
+
+## 4. What is a Similarity Threshold?
+
+A similarity threshold allows us to remove results
+below a specified cosine similarity value.
+
+Example:
+
+min_similarity = 0.5
+
+Only results with similarity >= 0.5 are returned.
+
+Thresholds should be evaluated against real documents
+and questions. A single threshold is not universally
+correct across embedding models and datasets.
+
+Our default is None, which disables threshold filtering.
+
+## 5. What is Metadata Filtering?
+
+Metadata filtering limits which documents can
+participate in retrieval.
+
+We currently support filtering by document_id.
+
+The PostgreSQL repository applies the document
+filter before returning nearest neighbors.
+
+Later, we can introduce additional filters such
+as document type, owner, and access permissions.
+
+## 6. What is Context Assembly?
+
+Context assembly prepares retrieved information
+for the LLM.
+
+Each retrieved chunk contains:
+
+- Original text
+- Document UUID
+- Source filename
+- Page number, when available
+- Heading, when available
+
+We format the evidence into source-labeled sections.
+
+This context will be passed to an LLM in Step 7.
+
+## 7. Why Preserve Source References?
+
+Source references let us trace retrieved information
+back to its original document.
+
+For example:
+
+Source [1]
+File: company_policy.pdf
+Page: 5
+
+An LLM can later refer to these source labels.
+
+We still need to validate that generated citations
+actually support the answer.
+
+## 8. RetrievalService
+
+The RetrievalService coordinates retrieval.
+
+Its responsibilities:
+
+1. Validate the user question.
+2. Generate the query embedding.
+3. Search the vector database.
+4. Apply optional similarity filtering.
+5. Assemble source-labeled context.
+6. Return structured retrieval results.
+
+The service does not know how PostgreSQL performs
+similarity calculations internally.
+
+## 9. ChunkSearchRepository
+
+ChunkSearchRepository is a Python Protocol.
+
+It defines the database operations required by
+the retrieval service.
+
+Our existing PgvectorRepository satisfies
+this interface through structural typing.
+
+This follows the Dependency Inversion Principle.
+
+The application depends on an abstraction rather
+than a specific database implementation.
+
+## 10. RetrievalResult
+
+RetrievalResult contains:
+
+- question
+- matches
+- context
+
+It also exposes has_results to indicate whether
+any evidence was retrieved.
+
+If no matches are found, context is an empty string.
+
+The application does not invent missing evidence.
+
+## 11. Why Use Dependency Injection?
+
+We pass the embedding provider and repository
+into the RetrievalService constructor.
+
+This allows us to use fake dependencies in tests
+and real dependencies in production.
+
+We can replace an embedding provider or database
+implementation without rewriting retrieval logic.
+
+## 12. How Does PostgreSQL Search Work?
+
+Our repository uses cosine distance.
+
+The pgvector cosine-distance operator is:
+
+<=>
+
+Cosine similarity is calculated as:
+
+1 - cosine_distance
+
+Results are ordered by ascending cosine distance.
+
+The repository also filters by embedding model.
+
+This avoids mixing incompatible embeddings.
+
+## 13. Automated Testing
+
+Step 6 adds 12 unit test cases.
+
+Tests verify:
+
+- Query embedding
+- Repository parameters
+- Top-K forwarding
+- Document filtering
+- Similarity threshold filtering
+- Context formatting
+- Empty-result handling
+- Invalid input validation
+
+We use fake providers and repositories to avoid
+requiring a live database during unit tests.
+
+The previous PostgreSQL integration test remains
+part of the complete test suite.
+
+Expected complete test count: 49.
+
+## 14. Current Limitations
+
+- Retrieval uses semantic vector search only.
+- No BM25 or hybrid search.
+- No reranking.
+- No query rewriting.
+- No LLM-generated answers.
+- No REST question-answering endpoint.
+- No authentication or document permissions.
+- No token-budget-based context assembly.
+- No retrieval quality benchmark yet.
+
+Retrieved document text is untrusted data.
+
+In future LLM prompts, source content must be treated
+as evidence, not as instructions to the model.
+
+## 15. Step 6 Result
+
+Our application can now:
+
+1. Accept a question.
+2. Generate a query embedding.
+3. Search previously stored document embeddings.
+4. Retrieve ranked source chunks.
+5. Filter results.
+6. Prepare structured evidence for an LLM.
+
+## Key Takeaway
+
+Embedding generation converts questions into vectors.
+
+A vector database finds similar stored vectors.
+
+A retrieval service coordinates those operations
+and prepares the evidence for generation.
+
+Retrieval quality directly affects the quality
+of the final RAG answer.
+
+
+
