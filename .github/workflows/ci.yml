@@ -30,5 +30,5 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: pip check
       - run: alembic upgrade head
-      - run: pytest -q
+      - run: python -m pytest -q
       - run: docker build -t rag-document-qa:ci .
